@@ -89,9 +89,11 @@ class AgentExecutor:
             return {"path": memory.get("input_path") or step.tool_input.get("path")}
 
         if step.tool_name == "text_extractor":
+            # LLMPlanner 可能会把占位符字符串写入 text（如“原文文本，由 file_reader 输出补充”）。
+            # 分析时必须优先使用 file_reader 已写入 Memory 的真实原文，避免把占位符传给模型。
             return {
-                "text": step.tool_input.get("text") or memory.get("text") or memory.get("meeting_text", ""),
-                "task": step.tool_input.get("task") or memory.get("task", ""),
+                "text": memory.get("text") or memory.get("meeting_text", "") or step.tool_input.get("text", ""),
+                "task": memory.get("task", "") or step.tool_input.get("task", ""),
             }
 
         if step.tool_name == "llm_analyze_meeting":
