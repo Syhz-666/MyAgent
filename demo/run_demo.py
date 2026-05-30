@@ -35,8 +35,8 @@ def main():
     if result.success:
         print(f"报告生成成功：{result.output_path}")
         for step in result.steps:
-            status_icon = "✓" if step.status == "success" else "✗"
-            print(f"  {status_icon} Step {step.step}: {step.action} — {step.observation}")
+            status_icon = "OK" if step.status == "success" else "FAIL"
+            print(f"  [{status_icon}] Step {step.step}: {step.action} - {step.observation}")
     else:
         print(f"报告生成失败：{result.error}")
         sys.exit(1)

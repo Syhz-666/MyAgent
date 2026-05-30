@@ -61,12 +61,12 @@ class LLMClient(Protocol):
 
 
 class OpenAILLMClient:
-    """基于 OpenAI SDK 兼容接口的 LLM 客户端。
+    """基于 OpenAI SDK 兼容接口的 LLM 客户端，默认对接 DeepSeek。
 
     可通过环境变量配置：
     - OPENAI_API_KEY：模型 API Key
-    - OPENAI_BASE_URL：兼容接口地址，可选
-    - OPENAI_MODEL：模型名称，默认 gpt-4o-mini
+    - OPENAI_BASE_URL：接口地址，默认 DeepSeek
+    - OPENAI_MODEL：模型名称，默认 deepseek-chat
     """
 
     def __init__(self, model: str | None = None) -> None:
@@ -74,13 +74,27 @@ class OpenAILLMClient:
             raise RuntimeError("未安装 openai 依赖，请先执行：pip install openai")
 
         api_key = os.getenv("OPENAI_API_KEY")
-        base_url = os.getenv("OPENAI_BASE_URL")
-        self.model = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        if not api_key:
+            api_key = self._read_api_key_from_file()
+
+        base_url = os.getenv("OPENAI_BASE_URL", "https://api.deepseek.com")
+        self.model = model or os.getenv("OPENAI_MODEL", "deepseek-chat")
 
         if not api_key:
-            raise RuntimeError("缺少 OPENAI_API_KEY 环境变量，无法调用 LLM")
+            raise RuntimeError(
+                "缺少 API Key，请设置 OPENAI_API_KEY 环境变量，"
+                "或在项目根目录创建 myagentapikey.txt 文件"
+            )
 
         self.client = OpenAI(api_key=api_key, base_url=base_url)
+
+    @staticmethod
+    def _read_api_key_from_file() -> str:
+        project_root = Path(__file__).resolve().parents[1]
+        key_file = project_root / "MyAgentAPIKey.txt"
+        if key_file.exists():
+            return key_file.read_text(encoding="utf-8").strip()
+        return ""
 
     def analyze_meeting(self, meeting_text: str) -> dict[str, Any]:
         system_prompt = (
@@ -217,7 +231,13 @@ class MeetingReportAgent:
     def __init__(self, llm_client: LLMClient | None = None) -> None:
         self.reader = FileReader()
         self.writer = FileWriter()
-        self.llm_client = llm_client or MockLLMClient()
+        if llm_client is not None:
+            self.llm_client = llm_client
+        else:
+            try:
+                self.llm_client = OpenAILLMClient()
+            except RuntimeError:
+                self.llm_client = MockLLMClient()
         self.steps: list[AgentStep] = []
 
     def run(self, input_path: str, output_path: str) -> AgentResult:
@@ -238,6 +258,12 @@ class MeetingReportAgent:
 
         meeting_text = read_result.output
         analysis = self._analyze_with_llm(meeting_text)
+        if not analysis:
+            return AgentResult(
+                success=False,
+                error="LLM 分析失败，未生成有效结构化结果",
+                steps=self.steps,
+            )
 
         report = build_markdown_report(analysis, self.steps)
         write_result = self._write_report(output_path, report)
