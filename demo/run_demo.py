@@ -20,17 +20,17 @@ def main():
     parser = argparse.ArgumentParser(description="华风灵境 Agent Demo")
     parser.add_argument(
         "--input",
-        default=str(project_root / "demo" / "input" / "q2_review_notes.txt"),
+        default=str(project_root / "demo" / "input" / "meeting_notes.txt"),
         help="输入会议记录文件路径",
     )
     parser.add_argument(
         "--output",
-        default=str(project_root / "demo" / "output" / "q2_review_report.md"),
+        default=str(project_root / "demo" / "output" / "meeting_report.md"),
         help="输出 Markdown 报告路径",
     )
     parser.add_argument(
         "--task",
-        default="请整理这份会议记录，提取会议概要、关键结论、行动项和风险点。",
+        default="请整理这份会议记录，提取行动项、负责人和截止时间",
         help="用户任务描述",
     )
     args = parser.parse_args()

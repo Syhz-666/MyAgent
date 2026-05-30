@@ -5,6 +5,7 @@ from .build_report import BuildReportTool
 from .file_reader import FileReader
 from .file_writer import FileWriter
 from .llm_analyze_meeting import LLMAnalyzeMeetingTool
+from .text_extractor import TextExtractor
 
 __all__ = [
     "BaseTool",
@@ -13,4 +14,5 @@ __all__ = [
     "FileReader",
     "FileWriter",
     "LLMAnalyzeMeetingTool",
+    "TextExtractor",
 ]

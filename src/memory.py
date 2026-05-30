@@ -1,7 +1,7 @@
 """Agent 短期记忆模块。
 
 Memory 负责保存一次 Agent 执行过程中的上下文、中间结果和工具观察。
-第二阶段中，Planner 只生成计划，Executor 负责执行，Memory 负责在步骤之间传递状态。
+第三阶段 3A 中，Memory 同时兼容第二阶段的 meeting_text 与通用 text。
 """
 
 from __future__ import annotations
@@ -37,8 +37,8 @@ class AgentMemory:
         """根据工具执行结果更新上下文。
 
         约定：
-        - file_reader 的输出保存为 meeting_text；
-        - llm_analyze_meeting 的输出保存为 analysis；
+        - file_reader 的输出保存为 text，同时兼容 meeting_text；
+        - text_extractor / llm_analyze_meeting 的输出保存为 analysis；
         - build_report 的输出保存为 report，同时也作为 file_writer 的 content；
         - file_writer 的输出保存为 written_path。
         """
@@ -46,8 +46,9 @@ class AgentMemory:
             return
 
         if step.tool_name == "file_reader":
+            self.set("text", observation.output)
             self.set("meeting_text", observation.output)
-        elif step.tool_name == "llm_analyze_meeting":
+        elif step.tool_name in {"text_extractor", "llm_analyze_meeting"}:
             self.set("analysis", observation.output)
         elif step.tool_name == "build_report":
             self.set("report", observation.output)

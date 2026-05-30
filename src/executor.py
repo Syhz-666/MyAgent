@@ -1,7 +1,7 @@
 """计划执行模块。
 
 Executor 负责根据 PlanStep 调用对应工具，并返回统一的 Observation。
-所有工具统一注册在 `self.tools` 中，不再对 LLM 或报告工具做特殊处理。
+第三阶段 3A 中，工具注册切换为通用 TextExtractor，同时保留旧工具名兼容。
 """
 
 from __future__ import annotations
@@ -11,20 +11,22 @@ from typing import Any, Callable
 try:
     from .memory import AgentMemory
     from .schemas import Observation, PlanStep
-    from .tools import BaseTool, BuildReportTool, FileReader, FileWriter, LLMAnalyzeMeetingTool
+    from .tools import BaseTool, BuildReportTool, FileReader, FileWriter, LLMAnalyzeMeetingTool, TextExtractor
 except ImportError:  # pragma: no cover - 支持直接导入
     from memory import AgentMemory
     from schemas import Observation, PlanStep
-    from tools import BaseTool, BuildReportTool, FileReader, FileWriter, LLMAnalyzeMeetingTool
+    from tools import BaseTool, BuildReportTool, FileReader, FileWriter, LLMAnalyzeMeetingTool, TextExtractor
 
 
 class AgentExecutor:
     """执行 PlanStep 的统一执行器。"""
 
     def __init__(self, llm_client: Any, report_builder: Callable[..., str]) -> None:
+        text_extractor = TextExtractor(llm_client)
         self.tools: dict[str, BaseTool] = {
             "file_reader": FileReader(),
             "file_writer": FileWriter(),
+            "text_extractor": text_extractor,
             "llm_analyze_meeting": LLMAnalyzeMeetingTool(llm_client),
             "build_report": BuildReportTool(report_builder),
         }
@@ -67,13 +69,23 @@ class AgentExecutor:
         if step.tool_name == "file_reader":
             return {"path": step.tool_input.get("path") or memory.get("input_path")}
 
+        if step.tool_name == "text_extractor":
+            return {
+                "text": step.tool_input.get("text") or memory.get("text") or memory.get("meeting_text", ""),
+                "task": step.tool_input.get("task") or memory.get("task", ""),
+            }
+
         if step.tool_name == "llm_analyze_meeting":
-            return {"meeting_text": step.tool_input.get("meeting_text") or memory.get("meeting_text", "")}
+            return {
+                "meeting_text": step.tool_input.get("meeting_text") or memory.get("meeting_text") or memory.get("text", ""),
+                "task": step.tool_input.get("task") or memory.get("task", ""),
+            }
 
         if step.tool_name == "build_report":
             return {
                 "analysis": step.tool_input.get("analysis") or memory.get("analysis", {}),
                 "steps": step.tool_input.get("steps") or memory.get("steps", []),
+                "task": step.tool_input.get("task") or memory.get("task", ""),
             }
 
         if step.tool_name == "file_writer":

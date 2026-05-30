@@ -1,11 +1,11 @@
-"""计划驱动式会议整理 Agent。
+"""任务驱动式通用文本处理 Agent。
 
-当前版本用于体现第二阶段 Agent Loop：
-1. Planner 生成结构化计划；
-2. Executor 根据计划调用工具；
-3. Memory 保存中间结果和观察；
-4. Agent 根据 Observation 判断是否继续；
-5. 最终生成并写入 Markdown 报告。
+第三阶段 3A 目标：
+1. 保留 SimplePlanner 的固定执行计划，保证 Demo 稳定；
+2. 将会议记录专用分析升级为 task 驱动的通用文本分析；
+3. 使用统一 Schema：summary、sections、follow_up_questions；
+4. 根据 task 和 sections 动态生成 Markdown 报告；
+5. 保留 MeetingReportAgent 兼容别名，避免旧入口失效。
 """
 
 from __future__ import annotations
@@ -58,8 +58,8 @@ class AgentResult:
 class LLMClient(Protocol):
     """LLM 客户端协议。"""
 
-    def analyze_meeting(self, meeting_text: str) -> dict[str, Any]:
-        """分析会议记录并返回结构化结果。"""
+    def analyze_text(self, text: str, task: str) -> dict[str, Any]:
+        """根据用户任务分析文本并返回统一结构化结果。"""
         ...
 
 
@@ -86,7 +86,7 @@ class OpenAILLMClient:
         if not api_key:
             raise RuntimeError(
                 "缺少 API Key，请设置 OPENAI_API_KEY 环境变量，"
-                "或在项目根目录创建 myagentapikey.txt 文件"
+                "或在项目根目录创建 MyAgentAPIKey.txt 文件"
             )
 
         self.client = OpenAI(api_key=api_key, base_url=base_url)
@@ -99,34 +99,39 @@ class OpenAILLMClient:
             return key_file.read_text(encoding="utf-8").strip()
         return ""
 
-    def analyze_meeting(self, meeting_text: str) -> dict[str, Any]:
+    def analyze_text(self, text: str, task: str) -> dict[str, Any]:
+        """根据用户任务动态分析文本，返回统一 JSON Schema。"""
         system_prompt = (
-            "你是一个办公资料整理 Agent，擅长从会议记录中提取结构化信息。"
-            "请只输出合法 JSON，不要输出 Markdown，不要添加额外解释。"
-            "如果原文没有明确负责人或截止时间，必须填写“待确认”，不能编造。"
+            "你是一个文本分析 Agent。用户会指定分析目标，请根据目标从文本中提取信息。"
+            "如果原文没有明确某类信息，对应内容必须标记为“待确认”，不能编造。"
+            "只输出合法 JSON，不要输出 Markdown，不要添加额外解释。"
         )
         user_prompt = f"""
-请分析下面的会议记录，并输出 JSON。
+任务：{task}
 
-JSON 字段要求：
+请根据任务分析下面的文本，并输出 JSON。
+
+JSON 格式必须固定为：
 {{
-  "meeting_summary": "会议概要，2-4 句话",
-  "key_conclusions": ["关键结论1", "关键结论2"],
-  "action_items": [
+  "summary": "文本概要，2-4 句话",
+  "sections": [
     {{
-      "task": "行动项",
-      "owner": "负责人，没有则写待确认",
-      "deadline": "截止时间，没有则写待确认",
-      "priority": "高/中/低/待确认",
-      "evidence": "原文依据片段，尽量不超过80字"
+      "title": "章节标题，由任务和文本内容决定",
+      "items": ["要点1", "要点2"]
     }}
   ],
-  "risks": ["风险或待确认问题"],
-  "follow_up_questions": ["会后待确认事项"]
+  "follow_up_questions": ["待确认问题1"]
 }}
 
-会议记录：
-{meeting_text}
+要求：
+1. summary 必须存在；
+2. sections 至少包含 1 个章节；
+3. sections[].title 应该贴合用户任务；
+4. sections[].items 应该是字符串列表；
+5. 信息缺失时写“待确认”，不要编造负责人、时间、结论或风险。
+
+文本：
+{text}
 """.strip()
 
         response = self.client.chat.completions.create(
@@ -138,98 +143,149 @@ JSON 字段要求：
             temperature=0.2,
         )
         content = response.choices[0].message.content or "{}"
-        return _parse_json_content(content)
+        return _normalize_analysis(_parse_json_content(content))
+
+    def analyze_meeting(self, meeting_text: str) -> dict[str, Any]:
+        """兼容第二阶段旧接口。"""
+        return self.analyze_text(
+            meeting_text,
+            "请整理这份会议记录，提取会议概要、关键结论、行动项和风险点。",
+        )
 
 
 class MockLLMClient:
     """本地模拟 LLM 客户端。
 
-    用于没有 API Key 时跑通 Demo。它不会真正理解文本，只根据当前示例会议记录生成稳定的结构化结果。
-    后续接入真实模型时，可替换为 OpenAILLMClient。
+    用于没有 API Key 时跑通 Demo。第三阶段 3A 中，Mock 会根据 task 关键词返回不同结构，
+    从而证明 --task 参数确实会影响输出。
     """
 
-    def analyze_meeting(self, meeting_text: str) -> dict[str, Any]:
+    def analyze_text(self, text: str, task: str) -> dict[str, Any]:
+        task_text = task.lower()
+
+        if any(keyword in task for keyword in ["风险", "待确认", "问题"]):
+            return {
+                "summary": "本次文本中存在若干需要关注的风险与待确认事项，主要集中在依赖条件、时间安排、验收标准和后续资源协调上。Agent 已根据用户任务聚焦风险识别，而不是生成完整行动项报告。",
+                "sections": [
+                    {
+                        "title": "风险点",
+                        "items": [
+                            "部分任务依赖外部接口或模型输出，存在稳定性和格式不可控风险。",
+                            "如果负责人、截止时间或验收口径不明确，后续执行可能出现责任边界不清。",
+                            "Demo 现场可能受到 API Key、网络环境或模型响应格式影响，需要保留 Mock 降级方案。",
+                        ],
+                    },
+                    {
+                        "title": "待确认事项",
+                        "items": [
+                            "是否需要为不同任务单独设计更严格的输出字段校验规则。",
+                            "是否需要在第三阶段 3B 中引入更强的计划校验和回退机制。",
+                            "是否需要保留第二阶段会议报告格式作为兼容模式。",
+                        ],
+                    },
+                ],
+                "follow_up_questions": [
+                    "LLMPlanner 失败时是否直接回退 SimplePlanner，还是先要求模型重新生成计划？",
+                    "报告章节是否需要限制最大数量，避免输出过长？",
+                ],
+            }
+
+        if any(keyword in task for keyword in ["行动项", "负责人", "截止", "任务"]):
+            return {
+                "summary": "本次文本主要围绕项目推进、阶段任务和后续交付展开。Agent 已按用户要求重点提取行动项、负责人、截止时间和执行依据。",
+                "sections": [
+                    {
+                        "title": "行动项",
+                        "items": [
+                            "完成 3A 改造：负责人待确认；截止时间待确认；内容包括 TextExtractor、动态报告和 task 透传。",
+                            "验证同一份输入在不同 task 下生成不同报告：负责人待确认；截止时间待确认。",
+                            "保留 MeetingReportAgent 兼容别名，避免旧 Demo 和旧入口失效。",
+                        ],
+                    },
+                    {
+                        "title": "负责人和截止时间",
+                        "items": [
+                            "如原文未明确负责人，标记为待确认，不进行编造。",
+                            "如原文未明确截止时间，标记为待确认，不进行编造。",
+                        ],
+                    },
+                ],
+                "follow_up_questions": [
+                    "是否需要把行动项输出为 Markdown 表格？",
+                    "是否需要为行动项增加优先级字段？",
+                ],
+            }
+
+        if any(keyword in task for keyword in ["观点", "主题", "分类", "总结", "核心"]):
+            return {
+                "summary": "文本的核心观点可以归纳为 Agent 架构演进、任务驱动分析、稳定 Demo 和后续动态规划四类主题。Agent 已按用户要求进行主题化总结。",
+                "sections": [
+                    {
+                        "title": "Agent 架构演进",
+                        "items": [
+                            "项目从固定流程升级到计划驱动 Agent Loop，再进一步走向任务驱动文本处理。",
+                            "Planner、Executor、Memory、Tool 的分层让项目更接近真实 Agent 产品原型。",
+                        ],
+                    },
+                    {
+                        "title": "任务驱动能力",
+                        "items": [
+                            "第三阶段 3A 的重点是让 --task 参数真正影响分析目标和报告结构。",
+                            "统一 Schema 让通用分析结果既稳定又具备扩展性。",
+                        ],
+                    },
+                    {
+                        "title": "稳定性设计",
+                        "items": [
+                            "MockLLMClient 和 SimplePlanner 能保证无 API Key 时仍可运行。",
+                            "兼容别名可以降低重构对旧入口的影响。",
+                        ],
+                    },
+                ],
+                "follow_up_questions": ["是否需要在 3B 阶段让不同任务产生不同计划步骤？"],
+            }
+
+        if "interview" in task_text or "summary" in task_text:
+            return {
+                "summary": "The text is processed as a general document analysis task. The agent focuses on task-driven extraction and produces adaptive sections based on the user's goal.",
+                "sections": [
+                    {
+                        "title": "Key Points",
+                        "items": [
+                            "The agent now accepts a custom task and uses it to guide text analysis.",
+                            "The report structure is generated from the unified sections schema.",
+                            "Fallback behavior remains available for stable demos.",
+                        ],
+                    }
+                ],
+                "follow_up_questions": ["Should the output language always follow the user's task language?"],
+            }
+
         return {
-            "meeting_summary": (
-                "本次会议围绕“华风灵境 Agent：办公资料整理与行动项提取助手”的 MVP 方案展开。"
-                "团队确认第一版聚焦会议记录整理，采用本地命令行 Demo，输出 Markdown 报告。"
-                "项目重点是体现 Agent Loop、工具调用、结构化输出和可追溯行动项提取。"
-            ),
-            "key_conclusions": [
-                "第一版项目聚焦会议记录整理与行动项提取，不扩展到复杂办公全场景。",
-                "Demo 必须体现 Agent Loop 和工具调用过程。",
-                "工具层先实现 FileReader 和 FileWriter，后续再增加 TextExtractor、KeywordSearch 等工具。",
-                "产品亮点确定为可追溯的行动项提取。",
-                "最终输出采用 Markdown 报告，路径暂定为 demo/output/meeting_report.md。",
-                "若信息缺失，Agent 应标记为“待确认”，不得编造负责人、时间或结论。",
+            "summary": "Agent 已根据用户任务对文本进行通用分析，并生成统一结构化结果。当前 Mock 模式不会真正理解全文，但会按照任务类型返回可用于 Demo 的稳定结果。",
+            "sections": [
+                {
+                    "title": "关键信息",
+                    "items": [
+                        "当前流程已从会议记录专用分析升级为通用文本分析。",
+                        "分析结果使用 summary、sections、follow_up_questions 统一结构。",
+                        "报告标题和章节会根据用户 task 与 sections 动态生成。",
+                    ],
+                }
             ],
-            "action_items": [
-                {
-                    "task": "完成 tools 层基础代码，包括 base_tool.py、file_reader.py 和 file_writer.py，并保证工具返回 ToolResult。",
-                    "owner": "王磊",
-                    "deadline": "今天 18:00 前",
-                    "priority": "高",
-                    "evidence": "王磊负责在今天 18:00 前完成 tools 层基础代码，包括 base_tool.py、file_reader.py 和 file_writer.py",
-                },
-                {
-                    "task": "补充一个简单的工具调用示例，方便 Agent 接入。",
-                    "owner": "王磊",
-                    "deadline": "明天中午前",
-                    "priority": "中",
-                    "evidence": "王磊还需要在明天中午前补一个简单的工具调用示例，方便 Agent 接入。",
-                },
-                {
-                    "task": "完成 agent.py 的最小固定流程版本，跑通读取会议记录、生成报告、写入结果的闭环。",
-                    "owner": "赵敏",
-                    "deadline": "明天 20:00 前",
-                    "priority": "高",
-                    "evidence": "赵敏负责在明天 20:00 前完成 agent.py 的最小固定流程版本",
-                },
-                {
-                    "task": "设计 Markdown 报告模板。",
-                    "owner": "陈雪",
-                    "deadline": "明天下午 16:00 前",
-                    "priority": "中",
-                    "evidence": "陈雪负责在明天下午 16:00 前设计 Markdown 报告模板",
-                },
-                {
-                    "task": "准备 2 份不同风格的测试会议记录，并检查输出报告是否存在无依据编造内容。",
-                    "owner": "周航",
-                    "deadline": "6 月 1 日前",
-                    "priority": "中",
-                    "evidence": "周航负责在 6 月 1 日前准备 2 份不同风格的测试会议记录",
-                },
-                {
-                    "task": "整理 Demo 演示说明。",
-                    "owner": "林佳",
-                    "deadline": "6 月 1 日前",
-                    "priority": "低",
-                    "evidence": "林佳负责在 6 月 1 日前整理 Demo 演示说明",
-                },
-                {
-                    "task": "完成 README 初稿。",
-                    "owner": "李明",
-                    "deadline": "6 月 2 日前",
-                    "priority": "中",
-                    "evidence": "李明负责在 6 月 2 日前完成 README 初稿",
-                },
-            ],
-            "risks": [
-                "会议记录中的负责人和截止时间可能不明确，Agent 不应强行补全。",
-                "后续接入模型后，可能受到上下文长度和输出格式稳定性的影响。",
-                "文件路径在不同操作系统下可能存在兼容问题，应尽量使用 pathlib.Path。",
-                "依据片段过长会影响表格可读性，需要控制长度。",
-            ],
-            "follow_up_questions": [
-                "是否需要在第一版中加入 text_extractor.py，还是先把抽取逻辑放在 agent.py 中？",
-                "README 是否使用中文还是中英文双语？",
-                "Demo 是否需要录屏展示？",
-            ],
+            "follow_up_questions": ["是否需要接入真实模型以获得更贴合原文的分析结果？"],
         }
 
+    def analyze_meeting(self, meeting_text: str) -> dict[str, Any]:
+        """兼容第二阶段旧接口。"""
+        return self.analyze_text(
+            meeting_text,
+            "请整理这份会议记录，提取会议概要、关键结论、行动项和风险点。",
+        )
 
-class MeetingReportAgent:
-    """会议记录整理 Agent。"""
+
+class TextProcessingAgent:
+    """任务驱动式通用文本处理 Agent。"""
 
     def __init__(self, llm_client: LLMClient | None = None) -> None:
         if llm_client is not None:
@@ -247,19 +303,10 @@ class MeetingReportAgent:
         self,
         input_path: str,
         output_path: str,
-        task: str = "请整理这份会议记录，提取会议概要、关键结论、行动项和风险点。",
+        task: str = "请整理这份文本，提取核心信息并生成结构化报告。",
         on_step: Callable[[AgentStep], None] | None = None,
     ) -> AgentResult:
-        """执行计划驱动式 Agent。
-
-        Args:
-            input_path: 输入会议记录文件路径。
-            output_path: 输出 Markdown 报告路径。
-            task: 用户任务描述。
-
-        Returns:
-            AgentResult: 执行结果。
-        """
+        """执行任务驱动式文本处理 Agent。"""
         self.steps = []
         memory = AgentMemory()
         memory.set("task", task)
@@ -337,10 +384,10 @@ class MeetingReportAgent:
         if plan_step.tool_name == "file_reader":
             return f"成功读取输入文件，共 {len(str(observation.output))} 个字符。"
 
-        if plan_step.tool_name == "llm_analyze_meeting" and isinstance(observation.output, dict):
-            conclusion_count = len(observation.output.get("key_conclusions", []))
-            action_count = len(observation.output.get("action_items", []))
-            return f"LLM 分析完成，提取到 {conclusion_count} 条关键结论、{action_count} 个行动项。"
+        if plan_step.tool_name in {"text_extractor", "llm_analyze_meeting"} and isinstance(observation.output, dict):
+            section_count = len(observation.output.get("sections", []))
+            question_count = len(observation.output.get("follow_up_questions", []))
+            return f"文本分析完成，生成 {section_count} 个动态章节、{question_count} 个待确认问题。"
 
         if plan_step.tool_name == "build_report":
             return f"Markdown 报告生成完成，共 {len(str(observation.output))} 个字符。"
@@ -353,56 +400,61 @@ class MeetingReportAgent:
     def _build_final_report(self, memory: AgentMemory) -> str:
         """在所有计划步骤完成后，重建包含完整执行摘要的最终报告。"""
         analysis = memory.get("analysis", {})
-        final_report = build_markdown_report(analysis, self.steps)
+        task = memory.get("task", "")
+        final_report = build_markdown_report(analysis, self.steps, task)
         memory.set("report", final_report)
         memory.set("content", final_report)
         return final_report
 
-def build_markdown_report(analysis: dict[str, Any], steps: list[AgentStep]) -> str:
-    """根据 LLM 分析结果和执行轨迹生成 Markdown 报告。"""
+
+# 向后兼容第二阶段入口和旧 import。
+MeetingReportAgent = TextProcessingAgent
+
+
+def build_markdown_report(analysis: dict[str, Any], steps: list[AgentStep], task: str = "") -> str:
+    """根据 task、LLM 分析结果和执行轨迹生成 Markdown 报告。"""
+    normalized = _normalize_analysis(analysis)
     lines: list[str] = []
-    lines.append("# 会议行动项整理报告")
+    title = task or "通用文本分析"
+
+    lines.append(f"# 分析报告：{title}")
     lines.append("")
 
-    lines.append("## 1. 会议概要")
+    lines.append("## 概要")
     lines.append("")
-    lines.append(str(analysis.get("meeting_summary", "待确认")))
-    lines.append("")
-
-    lines.append("## 2. 关键结论")
-    lines.append("")
-    for item in analysis.get("key_conclusions", []) or ["待确认"]:
-        lines.append(f"- {item}")
+    lines.append(str(normalized.get("summary", "待确认")))
     lines.append("")
 
-    lines.append("## 3. 行动项")
-    lines.append("")
-    lines.append("| 行动项 | 负责人 | 截止时间 | 优先级 | 依据片段 |")
-    lines.append("|--------|--------|----------|--------|----------|")
-    action_items = analysis.get("action_items", [])
-    if action_items:
-        for item in action_items:
-            task = _escape_markdown_table(str(item.get("task", "待确认")))
-            owner = _escape_markdown_table(str(item.get("owner", "待确认")))
-            deadline = _escape_markdown_table(str(item.get("deadline", "待确认")))
-            priority = _escape_markdown_table(str(item.get("priority", "待确认")))
-            evidence = _escape_markdown_table(_truncate(str(item.get("evidence", "待确认")), 80))
-            lines.append(f"| {task} | {owner} | {deadline} | {priority} | {evidence} |")
+    sections = normalized.get("sections", [])
+    if sections:
+        for section in sections:
+            section_title = _sanitize_heading(str(section.get("title", "未命名章节")))
+            items = section.get("items", [])
+            lines.append(f"## {section_title}")
+            lines.append("")
+            if isinstance(items, list) and items:
+                for item in items:
+                    lines.append(f"- {item}")
+            elif items:
+                lines.append(str(items))
+            else:
+                lines.append("- 待确认")
+            lines.append("")
     else:
-        lines.append("| 待确认 | 待确认 | 待确认 | 待确认 | 待确认 |")
-    lines.append("")
+        lines.append("## 分析结果")
+        lines.append("")
+        lines.append("- 待确认")
+        lines.append("")
 
-    lines.append("## 4. 风险与待确认问题")
-    lines.append("")
-    risks = analysis.get("risks", []) or []
-    follow_up_questions = analysis.get("follow_up_questions", []) or []
-    for item in risks + follow_up_questions:
-        lines.append(f"- {item}")
-    if not risks and not follow_up_questions:
-        lines.append("- 暂无")
-    lines.append("")
+    follow_up_questions = normalized.get("follow_up_questions", []) or []
+    if follow_up_questions:
+        lines.append("## 待确认问题")
+        lines.append("")
+        for question in follow_up_questions:
+            lines.append(f"- {question}")
+        lines.append("")
 
-    lines.append("## 5. Agent 执行过程摘要")
+    lines.append("## 执行过程")
     lines.append("")
     lines.append("| 步骤 | 思考 | 动作 | 观察结果 | 状态 |")
     lines.append("|------|------|------|----------|------|")
@@ -415,6 +467,78 @@ def build_markdown_report(analysis: dict[str, Any], steps: list[AgentStep]) -> s
 
     lines.append("")
     return "\n".join(lines)
+
+
+def _normalize_analysis(analysis: dict[str, Any]) -> dict[str, Any]:
+    """将分析结果归一化为第三阶段 3A 的统一 Schema。
+
+    兼容旧版会议结构，避免历史代码或旧 Mock 输出导致报告构建失败。
+    """
+    if not isinstance(analysis, dict):
+        return {
+            "summary": "待确认",
+            "sections": [{"title": "分析结果", "items": [str(analysis)]}],
+            "follow_up_questions": [],
+        }
+
+    if "summary" in analysis and "sections" in analysis:
+        sections = analysis.get("sections") or []
+        normalized_sections: list[dict[str, Any]] = []
+        for section in sections:
+            if isinstance(section, dict):
+                items = section.get("items", [])
+                if isinstance(items, str):
+                    items = [items]
+                normalized_sections.append(
+                    {
+                        "title": str(section.get("title", "未命名章节")),
+                        "items": items if isinstance(items, list) else [str(items)],
+                    }
+                )
+            else:
+                normalized_sections.append({"title": "分析结果", "items": [str(section)]})
+
+        return {
+            "summary": str(analysis.get("summary", "待确认")),
+            "sections": normalized_sections or [{"title": "分析结果", "items": ["待确认"]}],
+            "follow_up_questions": analysis.get("follow_up_questions", []) or [],
+        }
+
+    # 兼容第二阶段会议分析结构。
+    sections: list[dict[str, Any]] = []
+
+    key_conclusions = analysis.get("key_conclusions", []) or []
+    if key_conclusions:
+        sections.append({"title": "关键结论", "items": [str(item) for item in key_conclusions]})
+
+    action_items = analysis.get("action_items", []) or []
+    if action_items:
+        formatted_actions = []
+        for item in action_items:
+            if isinstance(item, dict):
+                formatted_actions.append(
+                    "；".join(
+                        [
+                            f"任务：{item.get('task', '待确认')}",
+                            f"负责人：{item.get('owner', '待确认')}",
+                            f"截止时间：{item.get('deadline', '待确认')}",
+                            f"优先级：{item.get('priority', '待确认')}",
+                        ]
+                    )
+                )
+            else:
+                formatted_actions.append(str(item))
+        sections.append({"title": "行动项", "items": formatted_actions})
+
+    risks = analysis.get("risks", []) or []
+    if risks:
+        sections.append({"title": "风险与问题", "items": [str(item) for item in risks]})
+
+    return {
+        "summary": str(analysis.get("meeting_summary", analysis.get("summary", "待确认"))),
+        "sections": sections or [{"title": "分析结果", "items": ["待确认"]}],
+        "follow_up_questions": analysis.get("follow_up_questions", []) or [],
+    }
 
 
 def _parse_json_content(content: str) -> dict[str, Any]:
@@ -435,6 +559,12 @@ def _escape_markdown_table(value: str) -> str:
     return value.replace("|", "\\|").replace("\n", " ")
 
 
+def _sanitize_heading(value: str) -> str:
+    """清理 Markdown 标题，避免空标题或换行。"""
+    cleaned = value.replace("\n", " ").strip().lstrip("#").strip()
+    return cleaned or "未命名章节"
+
+
 def _truncate(value: str, max_length: int) -> str:
     """截断过长文本，保持表格可读性。"""
     if len(value) <= max_length:
@@ -449,9 +579,10 @@ if __name__ == "__main__":
     input_file = project_root / "demo" / "input" / "meeting_notes.txt"
     output_file = project_root / "demo" / "output" / "meeting_report.md"
 
-    agent = MeetingReportAgent()
+    agent = TextProcessingAgent()
     result = agent.run(
-        str(input_file), str(output_file),
+        str(input_file),
+        str(output_file),
         on_step=print_step,
     )
 
