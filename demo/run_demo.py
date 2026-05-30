@@ -20,12 +20,12 @@ def main():
     parser = argparse.ArgumentParser(description="华风灵境 Agent Demo")
     parser.add_argument(
         "--input",
-        default=str(project_root / "demo" / "input" / "meeting_notes.txt"),
+        default=str(project_root / "demo" / "input" / "q2_review_notes.txt"),
         help="输入会议记录文件路径",
     )
     parser.add_argument(
         "--output",
-        default=str(project_root / "demo" / "output" / "meeting_report.md"),
+        default=str(project_root / "demo" / "output" / "q2_review_report.md"),
         help="输出 Markdown 报告路径",
     )
     parser.add_argument(
