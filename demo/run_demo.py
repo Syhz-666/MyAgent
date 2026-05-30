@@ -25,12 +25,12 @@ def main():
     )
     parser.add_argument(
         "--output",
-        default=str(project_root / "demo" / "output" / "meeting_report.md"),
+        default=str(project_root / "demo" / "output" / "meeting_report_3B_action.md"),
         help="输出 Markdown 报告路径",
     )
     parser.add_argument(
         "--task",
-        default="请整理这份会议记录，提取行动项、负责人和截止时间",
+        default="总结内容",
         help="用户任务描述",
     )
     args = parser.parse_args()
@@ -38,6 +38,10 @@ def main():
     agent = MeetingReportAgent()
     print(f"用户目标：{args.task}\n")
     result = agent.run(args.input, args.output, task=args.task, on_step=print_step)
+
+    print(f"\nPlanner mode: {agent.last_planner_mode}")
+    if agent.last_planner_error:
+        print(f"Planner error: {agent.last_planner_error}")
 
     if result.success:
         print(f"\n报告生成成功：{result.output_path}")

@@ -1,7 +1,7 @@
 """计划执行模块。
 
 Executor 负责根据 PlanStep 调用对应工具，并返回统一的 Observation。
-第三阶段 3A 中，工具注册切换为通用 TextExtractor，同时保留旧工具名兼容。
+第三阶段 3B 中，Executor 暴露 tool_descriptions，供 LLMPlanner 了解可用工具。
 """
 
 from __future__ import annotations
@@ -30,6 +30,28 @@ class AgentExecutor:
             "llm_analyze_meeting": LLMAnalyzeMeetingTool(llm_client),
             "build_report": BuildReportTool(report_builder),
         }
+        self.tool_descriptions: list[dict[str, Any]] = [
+            {
+                "name": "file_reader",
+                "description": "读取本地文本文件，输出原文文本内容。",
+                "params": {"path": "输入文件路径"},
+            },
+            {
+                "name": "text_extractor",
+                "description": "根据用户任务从文本中提取结构化信息，输出 summary、sections、follow_up_questions。",
+                "params": {"text": "原文文本，由 file_reader 输出补充", "task": "用户任务描述"},
+            },
+            {
+                "name": "build_report",
+                "description": "根据结构化分析结果、执行步骤和用户任务生成 Markdown 报告。",
+                "params": {"analysis": "分析结果 dict", "steps": "执行步骤列表", "task": "用户任务描述"},
+            },
+            {
+                "name": "file_writer",
+                "description": "将 Markdown 报告写入本地文件。",
+                "params": {"path": "输出文件路径", "content": "报告内容，由 build_report 输出补充"},
+            },
+        ]
 
     def execute(self, step: PlanStep, memory: AgentMemory) -> Observation:
         """执行一个计划步骤，并返回 Observation。"""
@@ -61,13 +83,10 @@ class AgentExecutor:
             )
 
     def _build_tool_input(self, step: PlanStep, memory: AgentMemory) -> dict[str, Any]:
-        """根据工具名筛选并补全参数。
-
-        不直接把整个 memory.data 传给工具，避免出现工具不接受的多余参数。
-        PlanStep 中已填的值优先，为空时从 Memory 补充。
-        """
+        """根据工具名筛选并补全参数。"""
         if step.tool_name == "file_reader":
-            return {"path": step.tool_input.get("path") or memory.get("input_path")}
+            # 输入路径必须以 Agent 运行上下文为准，避免 LLMPlanner 编造路径覆盖真实文件。
+            return {"path": memory.get("input_path") or step.tool_input.get("path")}
 
         if step.tool_name == "text_extractor":
             return {
@@ -82,16 +101,19 @@ class AgentExecutor:
             }
 
         if step.tool_name == "build_report":
+            # LLMPlanner 可能会把占位符字符串写入 analysis / steps。
+            # 报告构建必须优先使用 Memory 中真实的上游结果，避免参数污染。
             return {
-                "analysis": step.tool_input.get("analysis") or memory.get("analysis", {}),
-                "steps": step.tool_input.get("steps") or memory.get("steps", []),
-                "task": step.tool_input.get("task") or memory.get("task", ""),
+                "analysis": memory.get("analysis", {}) or step.tool_input.get("analysis") or {},
+                "steps": memory.get("steps", []) or step.tool_input.get("steps") or [],
+                "task": memory.get("task", "") or step.tool_input.get("task") or "",
             }
 
         if step.tool_name == "file_writer":
+            # 输出路径必须以 Agent 运行上下文为准，避免 LLMPlanner 编造路径覆盖真实目标。
             return {
-                "path": step.tool_input.get("path") or memory.get("output_path"),
-                "content": step.tool_input.get("content") or memory.get("content") or memory.get("report", ""),
+                "path": memory.get("output_path") or step.tool_input.get("path"),
+                "content": memory.get("content") or memory.get("report", "") or step.tool_input.get("content") or "",
             }
 
         return dict(step.tool_input)
