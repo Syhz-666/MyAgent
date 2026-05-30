@@ -1,14 +1,11 @@
-"""固定流程 Agent。
+"""计划驱动式会议整理 Agent。
 
-当前版本用于跑通题目一的最小闭环：
-1. 读取输入会议记录；
-2. 调用 LLM 对会议内容进行结构化分析；
-3. 生成 Markdown 报告；
-4. 调用文件写入工具保存报告。
-
-说明：
-- 这里的 Agent Loop 先采用固定流程，便于快速完成可运行 Demo。
-- 后续可以继续拆分出 planner.py、executor.py、memory.py，实现更动态的计划与工具选择。
+当前版本用于体现第二阶段 Agent Loop：
+1. Planner 生成结构化计划；
+2. Executor 根据计划调用工具；
+3. Memory 保存中间结果和观察；
+4. Agent 根据 Observation 判断是否继续；
+5. 最终生成并写入 Markdown 报告。
 """
 
 from __future__ import annotations
@@ -17,7 +14,7 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 try:
     from openai import OpenAI
@@ -25,9 +22,15 @@ except ImportError:  # pragma: no cover - 允许在未安装 openai 时使用 Mo
     OpenAI = None
 
 try:
-    from .tools import FileReader, FileWriter, ToolResult
+    from .executor import AgentExecutor
+    from .memory import AgentMemory
+    from .planner import SimplePlanner
+    from .schemas import Observation, PlanStep
 except ImportError:  # pragma: no cover - 支持直接运行 python src/agent.py
-    from tools import FileReader, FileWriter, ToolResult
+    from executor import AgentExecutor
+    from memory import AgentMemory
+    from planner import SimplePlanner
+    from schemas import Observation, PlanStep
 
 
 @dataclass
@@ -229,8 +232,6 @@ class MeetingReportAgent:
     """会议记录整理 Agent。"""
 
     def __init__(self, llm_client: LLMClient | None = None) -> None:
-        self.reader = FileReader()
-        self.writer = FileWriter()
         if llm_client is not None:
             self.llm_client = llm_client
         else:
@@ -238,114 +239,124 @@ class MeetingReportAgent:
                 self.llm_client = OpenAILLMClient()
             except RuntimeError:
                 self.llm_client = MockLLMClient()
+        self.planner = SimplePlanner()
+        self.executor = AgentExecutor(self.llm_client, build_markdown_report)
         self.steps: list[AgentStep] = []
 
-    def run(self, input_path: str, output_path: str) -> AgentResult:
-        """执行固定流程 Agent。
+    def run(
+        self,
+        input_path: str,
+        output_path: str,
+        task: str = "请整理这份会议记录，提取会议概要、关键结论、行动项和风险点。",
+        on_step: Callable[[AgentStep], None] | None = None,
+    ) -> AgentResult:
+        """执行计划驱动式 Agent。
 
         Args:
             input_path: 输入会议记录文件路径。
             output_path: 输出 Markdown 报告路径。
+            task: 用户任务描述。
 
         Returns:
             AgentResult: 执行结果。
         """
         self.steps = []
+        memory = AgentMemory()
+        memory.set("task", task)
+        memory.set("input_path", input_path)
+        memory.set("output_path", output_path)
+        memory.set("steps", self.steps)
 
-        read_result = self._read_input(input_path)
-        if not read_result.success:
-            return AgentResult(success=False, error=read_result.error, steps=self.steps)
+        plan = self.planner.create_plan(task, input_path, output_path)
 
-        meeting_text = read_result.output
-        analysis = self._analyze_with_llm(meeting_text)
-        if not analysis:
+        for plan_step in plan:
+            observation = self.executor.execute(plan_step, memory)
+            memory.add_observation(observation)
+            memory.update_from(plan_step, observation)
+            self._record_observation(plan_step, observation)
+            memory.set("steps", self.steps)
+            if on_step:
+                on_step(self.steps[-1])
+
+            if not observation.success:
+                return AgentResult(
+                    success=False,
+                    error=observation.error,
+                    report=memory.get("report", ""),
+                    steps=self.steps,
+                )
+
+        final_report = self._build_final_report(memory)
+
+        final_write_step = PlanStep(
+            step_id=len(plan) + 1,
+            goal="回写包含完整执行摘要的最终报告",
+            tool_name="file_writer",
+            tool_input={"path": output_path},
+            expected_output="最终报告已保存",
+        )
+        final_write_observation = self.executor.execute(final_write_step, memory)
+        memory.add_observation(final_write_observation)
+        memory.update_from(final_write_step, final_write_observation)
+        self._record_observation(final_write_step, final_write_observation)
+        if on_step:
+            on_step(self.steps[-1])
+
+        if not final_write_observation.success:
             return AgentResult(
                 success=False,
-                error="LLM 分析失败，未生成有效结构化结果",
-                steps=self.steps,
-            )
-
-        report = build_markdown_report(analysis, self.steps)
-        write_result = self._write_report(output_path, report)
-        if not write_result.success:
-            return AgentResult(success=False, error=write_result.error, steps=self.steps)
-
-        final_report = build_markdown_report(analysis, self.steps)
-        final_write_result = self.writer.run(path=output_path, content=final_report)
-        if not final_write_result.success:
-            return AgentResult(
-                success=False,
-                error=f"最终报告回写失败：{final_write_result.error}",
+                error=f"最终报告回写失败：{final_write_observation.error}",
                 report=final_report,
                 steps=self.steps,
             )
 
         return AgentResult(
             success=True,
-            output_path=write_result.output,
+            output_path=memory.get("output_path", output_path),
             report=final_report,
             steps=self.steps,
         )
 
-    def _read_input(self, input_path: str) -> ToolResult:
-        self._record_step(
-            thought="需要先读取用户提供的会议记录文件。",
-            action="file_reader",
-            observation=f"准备读取文件：{input_path}",
-        )
-        result = self.reader.run(path=input_path)
-        if result.success:
-            self.steps[-1].observation = f"成功读取输入文件，共 {len(result.output)} 个字符。"
-        else:
-            self.steps[-1].status = "failed"
-            self.steps[-1].observation = result.error
-        return result
-
-    def _analyze_with_llm(self, meeting_text: str) -> dict[str, Any]:
-        self._record_step(
-            thought="需要调用 LLM 对会议记录进行结构化分析，提取结论、行动项和风险。",
-            action="llm_analyze_meeting",
-            observation="准备调用 LLM 进行会议内容分析。",
-        )
-        try:
-            analysis = self.llm_client.analyze_meeting(meeting_text)
-        except (ValueError, RuntimeError) as e:
-            self.steps[-1].status = "failed"
-            self.steps[-1].observation = str(e)
-            return {}
-        action_count = len(analysis.get("action_items", []))
-        conclusion_count = len(analysis.get("key_conclusions", []))
-        self.steps[-1].observation = (
-            f"LLM 分析完成，提取到 {conclusion_count} 条关键结论、{action_count} 个行动项。"
-        )
-        return analysis
-
-    def _write_report(self, output_path: str, report: str) -> ToolResult:
-        self._record_step(
-            thought="需要调用文件写入工具，将最终 Markdown 报告保存到本地。",
-            action="file_writer",
-            observation=f"准备写入报告：{output_path}",
-        )
-        result = self.writer.run(path=output_path, content=report)
-        if result.success:
-            self.steps[-1].observation = f"报告写入成功：{result.output}"
-        else:
-            self.steps[-1].status = "failed"
-            self.steps[-1].observation = result.error
-        return result
-
-
-    def _record_step(self, thought: str, action: str, observation: str, status: str = "success") -> None:
+    def _record_observation(self, plan_step: PlanStep, observation: Observation) -> None:
+        """将执行层 Observation 转换为展示层 AgentStep。"""
         self.steps.append(
             AgentStep(
-                step=len(self.steps) + 1,
-                thought=thought,
-                action=action,
-                observation=observation,
-                status=status,
+                step=plan_step.step_id,
+                thought=plan_step.goal,
+                action=plan_step.tool_name,
+                observation=self._format_observation(plan_step, observation),
+                status="success" if observation.success else "failed",
             )
         )
 
+    def _format_observation(self, plan_step: PlanStep, observation: Observation) -> str:
+        """将不同工具的输出压缩成适合报告展示的观察文本。"""
+        if not observation.success:
+            return observation.error
+
+        if plan_step.tool_name == "file_reader":
+            return f"成功读取输入文件，共 {len(str(observation.output))} 个字符。"
+
+        if plan_step.tool_name == "llm_analyze_meeting" and isinstance(observation.output, dict):
+            conclusion_count = len(observation.output.get("key_conclusions", []))
+            action_count = len(observation.output.get("action_items", []))
+            return f"LLM 分析完成，提取到 {conclusion_count} 条关键结论、{action_count} 个行动项。"
+
+        if plan_step.tool_name == "build_report":
+            return f"Markdown 报告生成完成，共 {len(str(observation.output))} 个字符。"
+
+        if plan_step.tool_name == "file_writer":
+            return f"报告写入成功：{observation.output}"
+
+        return _truncate(str(observation.output), 120)
+
+    def _build_final_report(self, memory: AgentMemory) -> str:
+        """在所有计划步骤完成后，重建包含完整执行摘要的最终报告。"""
+        analysis = memory.get("analysis", {})
+        final_report = build_markdown_report(analysis, self.steps)
+        memory.set("report", final_report)
+        memory.set("content", final_report)
+        return final_report
 
 def build_markdown_report(analysis: dict[str, Any], steps: list[AgentStep]) -> str:
     """根据 LLM 分析结果和执行轨迹生成 Markdown 报告。"""
@@ -432,12 +443,17 @@ def _truncate(value: str, max_length: int) -> str:
 
 
 if __name__ == "__main__":
+    from console_trace import print_step
+
     project_root = Path(__file__).resolve().parents[1]
     input_file = project_root / "demo" / "input" / "meeting_notes.txt"
     output_file = project_root / "demo" / "output" / "meeting_report.md"
 
     agent = MeetingReportAgent()
-    result = agent.run(str(input_file), str(output_file))
+    result = agent.run(
+        str(input_file), str(output_file),
+        on_step=print_step,
+    )
 
     if result.success:
         print(f"报告生成成功：{result.output_path}")

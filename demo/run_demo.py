@@ -13,6 +13,7 @@ project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root))
 
 from src.agent import MeetingReportAgent
+from src.console_trace import print_step
 
 
 def main():
@@ -27,18 +28,21 @@ def main():
         default=str(project_root / "demo" / "output" / "meeting_report.md"),
         help="输出 Markdown 报告路径",
     )
+    parser.add_argument(
+        "--task",
+        default="请整理这份会议记录，提取会议概要、关键结论、行动项和风险点。",
+        help="用户任务描述",
+    )
     args = parser.parse_args()
 
     agent = MeetingReportAgent()
-    result = agent.run(args.input, args.output)
+    print(f"用户目标：{args.task}\n")
+    result = agent.run(args.input, args.output, task=args.task, on_step=print_step)
 
     if result.success:
-        print(f"报告生成成功：{result.output_path}")
-        for step in result.steps:
-            status_icon = "OK" if step.status == "success" else "FAIL"
-            print(f"  [{status_icon}] Step {step.step}: {step.action} - {step.observation}")
+        print(f"\n报告生成成功：{result.output_path}")
     else:
-        print(f"报告生成失败：{result.error}")
+        print(f"\n报告生成失败：{result.error}")
         sys.exit(1)
 
 

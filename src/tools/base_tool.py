@@ -1,7 +1,8 @@
 """工具基类。"""
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass
@@ -9,7 +10,7 @@ class ToolResult:
     """工具执行结果。"""
 
     success: bool
-    output: str = ""
+    output: Any = None
     error: str = ""
 
 
