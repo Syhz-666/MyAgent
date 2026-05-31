@@ -39,6 +39,7 @@ class AgentMemory:
         约定：
         - file_reader 的输出保存为 text，同时兼容 meeting_text；
         - text_extractor / llm_analyze_meeting 的输出保存为 analysis；
+        - keyword_search 的输出保存为 keyword_search_results；
         - build_report 的输出保存为 report，同时也作为 file_writer 的 content；
         - file_writer 的输出保存为 written_path。
         """
@@ -48,6 +49,8 @@ class AgentMemory:
         if step.tool_name == "file_reader":
             self.set("text", observation.output)
             self.set("meeting_text", observation.output)
+        elif step.tool_name == "keyword_search":
+            self.set("keyword_search_results", observation.output)
         elif step.tool_name in {"text_extractor", "llm_analyze_meeting"}:
             self.set("analysis", observation.output)
         elif step.tool_name == "build_report":

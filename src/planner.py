@@ -186,12 +186,20 @@ def validate_plan(plan: list[PlanStep], available_tools: set[str]) -> bool:
     if any(tool_name not in tool_names for tool_name in required_tools):
         return False
 
-    return (
-        _first_index(tool_names, "file_reader")
-        < _first_index(tool_names, "text_extractor")
-        < _first_index(tool_names, "build_report")
-        < _first_index(tool_names, "file_writer")
-    )
+    reader_index = _first_index(tool_names, "file_reader")
+    extractor_index = _first_index(tool_names, "text_extractor")
+    report_index = _first_index(tool_names, "build_report")
+    writer_index = _first_index(tool_names, "file_writer")
+
+    if not (reader_index < extractor_index < report_index < writer_index):
+        return False
+
+    # keyword_search 是可选证据检索工具。如出现，必须位于读取之后、分析之前。
+    for index, tool_name in enumerate(tool_names):
+        if tool_name == "keyword_search" and not (reader_index < index < extractor_index):
+            return False
+
+    return True
 
 
 def _first_index(values: list[str], target: str) -> int:

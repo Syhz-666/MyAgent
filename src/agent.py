@@ -1,10 +1,10 @@
 """任务驱动式通用文本处理 Agent.
 
-第三阶段 3B 目标:
-1. 保留 SimplePlanner 作为稳定降级方案; 
-2. 新增 LLMPlanner, 根据 task 和工具描述动态生成计划; 
-3. 对动态计划进行合法性校验, 失败时回退 SimplePlanner; 
-4. 继续使用 TextExtractor 与动态报告能力.
+第五阶段目标:
+1. 保持真实 LLM API 为默认主路径, Mock 仅作为降级;
+2. 引入 keyword_search 证据检索工具;
+3. 根据 task 意图决定是否检索证据、是否输出可追溯行动项;
+4. 保持通用文本处理定位, 非行动项任务不强制渲染行动项表格.
 """
 
 from __future__ import annotations
@@ -32,6 +32,12 @@ except ImportError:  # pragma: no cover - 支持直接运行 python src/agent.py
     from schemas import Observation, PlanStep
 
 
+ACTION_ITEM_KEYWORDS = ["行动项", "负责人", "截止", "跟进", "任务", "待办", "分工"]
+RISK_KEYWORDS = ["风险", "问题", "阻塞", "延期", "依赖", "不稳定", "待确认"]
+ACTION_SEARCH_KEYWORDS = ["负责", "完成", "截止", "跟进", "同步", "推进", "排期", "待办"]
+RISK_SEARCH_KEYWORDS = ["风险", "问题", "阻塞", "延期", "依赖", "不稳定", "待确认"]
+
+
 @dataclass
 class AgentStep:
     """记录 Agent 每一步的执行轨迹."""
@@ -57,7 +63,13 @@ class AgentResult:
 class LLMClient(Protocol):
     """LLM 客户端协议."""
 
-    def analyze_text(self, text: str, task: str) -> dict[str, Any]:
+    def analyze_text(
+        self,
+        text: str,
+        task: str,
+        search_results: dict[str, Any] | None = None,
+        extract_action_items: bool = False,
+    ) -> dict[str, Any]:
         """根据用户任务分析文本并返回统一结构化结果."""
         ...
 
@@ -129,12 +141,13 @@ class OpenAILLMClient:
 }}
 
 约束:
-1. 只能使用 file_reader, text_extractor, build_report, file_writer; 
-2. 必须先读取文件, 再分析文本, 再生成报告, 最后写入文件; 
-3. file_reader 的 tool_input 可以留空或包含 path; 
-4. text_extractor 的 tool_input 必须包含 task; 
-5. build_report 的 tool_input 必须包含 task; 
-6. file_writer 必须最后执行.
+1. 只能使用可用工具列表中的工具;
+2. 必须先读取文件, 再分析文本, 再生成报告, 最后写入文件;
+3. keyword_search 是可选工具, 如使用, 必须位于 file_reader 之后、text_extractor 之前;
+4. file_reader 的 tool_input 可以留空或包含 path;
+5. text_extractor 的 tool_input 必须包含 task;
+6. build_report 的 tool_input 必须包含 task;
+7. file_writer 必须最后执行.
 """.strip()
 
         response = self.client.chat.completions.create(
@@ -148,20 +161,31 @@ class OpenAILLMClient:
         content = response.choices[0].message.content or "{}"
         return _parse_json_content(content)
 
-    def analyze_text(self, text: str, task: str) -> dict[str, Any]:
-        """根据用户任务动态分析文本, 返回统一 JSON Schema."""
+    def analyze_text(
+        self,
+        text: str,
+        task: str,
+        search_results: dict[str, Any] | None = None,
+        extract_action_items: bool = False,
+    ) -> dict[str, Any]:
+        """根据用户任务动态分析文本, 返回通用骨架和可选行动项."""
         system_prompt = (
-            "你是一个文本分析 Agent.用户会指定分析目标, 请根据目标从文本中提取信息."
+            "你是一个通用文本分析 Agent.用户会指定分析目标, 请根据目标从文本中提取信息."
             "下面“文本”字段一定是用户提供的原始文本, 不得声称文本缺失或未提供."
+            "如果用户任务与文本内容明显不匹配（如任务询问'国外发展'但文本只涉及中国情况），在 summary 中如实指出差异，sections 仅提取文本中勉强相关的部分并标注'文本未覆盖'，不要强行将无关内容当答案."
+            "summary、sections、follow_up_questions 是通用输出骨架."
+            "action_items 是可选业务增强字段, 只有在明确要求提取行动项、负责人、截止时间、跟进事项、任务分工或待办事项时才输出."
             "如果原文没有明确某类信息, 对应内容必须标记为“待确认”或“未在文本中找到对应信息”, 不能编造."
             "只输出合法 JSON, 不要输出 Markdown, 不要添加额外解释."
         )
+        action_item_instruction = _build_action_item_instruction(extract_action_items)
+        search_context = _format_search_results(search_results)
         user_prompt = f"""
 任务:{task}
 
 请根据任务分析下面的文本, 并输出 JSON.
 
-JSON 格式必须固定为:
+基础 JSON 格式必须包含:
 {{
   "summary": "文本概要, 2-4 句话",
   "sections": [
@@ -173,12 +197,21 @@ JSON 格式必须固定为:
   "follow_up_questions": ["待确认问题1"]
 }}
 
+{action_item_instruction}
+
 要求:
-1. summary 必须存在; 
-2. sections 至少包含 1 个章节; 
-3. sections[].title 应该贴合用户任务; 
-4. sections[].items 应该是字符串列表; 
-5. 信息缺失时写"待确认", 不要编造负责人, 时间, 结论或风险.
+1. summary 必须存在;
+2. sections 只包含与用户任务直接相关的章节, sections 的划分服务于用户任务, 而不是还原原文的段落结构;
+3. 如果任务是具体问题（如”xxx是什么””xxx的原因是什么”）, 用 1-2 个 sections 聚焦回答即可;
+4. 如果任务是全面总结（如”按主题归纳””提取所有要点”）, 可以展开更多章节;
+5. sections[].title 应该贴合用户任务;
+6. sections[].items 应该是字符串列表;
+7. 信息缺失时写”待确认”或”未在文本中找到对应信息”;
+8. 不要编造负责人、截止时间、优先级、结论或风险;
+9. 搜索结果只是证据候选, 不代表最终结论, 必须结合全文判断.
+
+搜索结果候选:
+{search_context}
 
 文本:
 {text}
@@ -200,23 +233,24 @@ JSON 格式必须固定为:
         return self.analyze_text(
             meeting_text,
             "请整理这份会议记录, 提取会议概要, 关键结论, 行动项和风险点.",
+            extract_action_items=True,
         )
 
 
 class MockLLMClient:
     """本地模拟 LLM 客户端.
 
-    用于没有 API Key 时跑通 Demo.第三阶段 3B 中, Mock 同时模拟动态规划和任务驱动分析.
+    用于没有 API Key 时跑通 Demo.Mock 仅作为降级占位, 不作为主要产品能力来源.
     """
 
     def plan_text_processing(self, task: str, tool_descriptions: list[dict[str, Any]]) -> dict[str, Any]:
         """根据 task 生成可验证差异的动态计划."""
-        if any(keyword in task for keyword in ["风险", "待确认", "问题"]):
+        if any(keyword in task for keyword in RISK_KEYWORDS):
             analysis_goal = "聚焦风险点和待确认事项, 分析文本内容"
             report_goal = "生成风险与待确认事项专项报告"
-        elif any(keyword in task for keyword in ["行动项", "负责人", "截止", "任务"]):
-            analysis_goal = "聚焦行动项, 负责人和截止时间, 分析文本内容"
-            report_goal = "生成行动项跟进报告"
+        elif _should_extract_action_items(task):
+            analysis_goal = "聚焦行动项, 负责人, 截止时间和依据片段, 分析文本内容"
+            report_goal = "生成可追溯行动项报告"
         elif any(keyword in task for keyword in ["观点", "主题", "分类", "总结", "核心"]):
             analysis_goal = "按主题分类总结核心观点"
             report_goal = "生成主题分类总结报告"
@@ -257,127 +291,111 @@ class MockLLMClient:
             ]
         }
 
-    def analyze_text(self, text: str, task: str) -> dict[str, Any]:
+    def analyze_text(
+        self,
+        text: str,
+        task: str,
+        search_results: dict[str, Any] | None = None,
+        extract_action_items: bool = False,
+    ) -> dict[str, Any]:
         task_text = task.lower()
 
-        if any(keyword in task for keyword in ["风险", "待确认", "问题"]):
-            return {
-                "summary": "本次文本中存在若干需要关注的风险与待确认事项, 主要集中在依赖条件, 时间安排, 验收标准和后续资源协调上.Agent 已根据用户任务聚焦风险识别, 而不是生成完整行动项报告.",
-                "sections": [
-                    {
-                        "title": "风险点",
-                        "items": [
-                            "部分任务依赖外部接口或模型输出, 存在稳定性和格式不可控风险.",
-                            "如果负责人, 截止时间或验收口径不明确, 后续执行可能出现责任边界不清.",
-                            "Demo 现场可能受到 API Key, 网络环境或模型响应格式影响, 需要保留 Mock 降级方案.",
-                        ],
-                    },
-                    {
-                        "title": "待确认事项",
-                        "items": [
-                            "是否需要为不同任务单独设计更严格的输出字段校验规则.",
-                            "是否需要在第三阶段 3B 中引入更强的计划校验和回退机制.",
-                            "是否需要保留第二阶段会议报告格式作为兼容模式.",
-                        ],
-                    },
-                ],
-                "follow_up_questions": [
-                    "LLMPlanner 失败时是否直接回退 SimplePlanner, 还是先要求模型重新生成计划？",
-                    "报告章节是否需要限制最大数量, 避免输出过长？",
-                ],
-            }
-
-        if any(keyword in task for keyword in ["行动项", "负责人", "截止", "任务"]):
-            return {
-                "summary": "本次文本主要围绕项目推进, 阶段任务和后续交付展开.Agent 已按用户要求重点提取行动项, 负责人, 截止时间和执行依据.",
-                "sections": [
-                    {
-                        "title": "行动项",
-                        "items": [
-                            "完成 3B 改造:负责人待确认; 截止时间待确认; 内容包括 LLMPlanner, tool_descriptions, 计划校验和回退机制.",
-                            "验证同一份输入在不同 task 下生成不同计划和不同报告:负责人待确认; 截止时间待确认.",
-                            "保留 SimplePlanner 降级方案, 确保动态规划失败时 Demo 仍可运行.",
-                        ],
-                    },
-                    {
-                        "title": "负责人和截止时间",
-                        "items": [
-                            "如原文未明确负责人, 标记为待确认, 不进行编造.",
-                            "如原文未明确截止时间, 标记为待确认, 不进行编造.",
-                        ],
-                    },
-                ],
-                "follow_up_questions": [
-                    "是否需要把行动项输出为 Markdown 表格？",
-                    "是否需要为行动项增加优先级字段？",
-                ],
-            }
-
-        if any(keyword in task for keyword in ["观点", "主题", "分类", "总结", "核心"]):
-            return {
-                "summary": "文本的核心观点可以归纳为 Agent 架构演进, 任务驱动分析, 动态规划和稳定回退四类主题.Agent 已按用户要求进行主题化总结.",
-                "sections": [
-                    {
-                        "title": "Agent 架构演进",
-                        "items": [
-                            "项目从固定流程升级到计划驱动 Agent Loop, 再进一步走向任务驱动动态规划.",
-                            "Planner, Executor, Memory, Tool 的分层让项目更接近真实 Agent 产品原型.",
-                        ],
-                    },
-                    {
-                        "title": "动态规划能力",
-                        "items": [
-                            "第三阶段 3B 的重点是让 LLMPlanner 根据 task 和工具描述生成计划.",
-                            "不同任务可以产生不同的步骤目标, 从而体现计划层的任务感知能力.",
-                        ],
-                    },
-                    {
-                        "title": "稳定性设计",
-                        "items": [
-                            "validate_plan 可以拦截非法工具和异常顺序.",
-                            "SimplePlanner 回退机制能保证动态规划失败时仍可完成任务.",
-                        ],
-                    },
-                ],
-                "follow_up_questions": ["是否需要进一步允许 LLMPlanner 选择可选工具或跳过非必要步骤？"],
-            }
-
-        if "interview" in task_text or "summary" in task_text:
-            return {
-                "summary": "The text is processed as a general document analysis task. The agent uses dynamic planning, task-driven extraction, and adaptive report generation.",
-                "sections": [
-                    {
-                        "title": "Key Points",
-                        "items": [
-                            "The planner can now generate a plan from the user task and tool descriptions.",
-                            "The plan is validated before execution.",
-                            "Fallback behavior remains available for stable demos.",
-                        ],
-                    }
-                ],
-                "follow_up_questions": ["Should optional tools be introduced in the next stage?"],
-            }
-
-        return {
-            "summary": "Agent 已根据用户任务对文本进行通用分析, 并生成统一结构化结果.当前 Mock 模式会同时模拟动态规划和任务驱动分析.",
-            "sections": [
+        if any(keyword in task for keyword in RISK_KEYWORDS):
+            return _normalize_analysis(
                 {
-                    "title": "关键信息",
-                    "items": [
-                        "当前流程已从固定计划升级为可动态生成计划的文本处理 Agent.",
-                        "Executor 向 Planner 暴露 tool_descriptions.",
-                        "计划执行前会经过 validate_plan 校验, 不合法则回退 SimplePlanner.",
+                    "summary": "本次文本中存在若干需要关注的风险与待确认事项.Agent 已根据用户任务聚焦风险识别, 不会强行生成行动项.",
+                    "sections": [
+                        {
+                            "title": "风险点",
+                            "items": _mock_risk_items(text, search_results),
+                        },
+                        {
+                            "title": "待确认事项",
+                            "items": [
+                                "如原文未明确负责人、截止时间或验收口径, 需要后续确认.",
+                                "如风险仅来自上下文推断, 应在最终决策前人工复核.",
+                            ],
+                        },
+                    ],
+                    "follow_up_questions": [
+                        "是否需要进一步区分高、中、低优先级风险？",
+                        "是否需要将风险转化为后续跟进行动项？",
                     ],
                 }
-            ],
-            "follow_up_questions": ["是否需要引入更多工具以体现真正的工具选择能力？"],
-        }
+            )
+
+        if extract_action_items:
+            return _normalize_analysis(
+                {
+                    "summary": "本次文本包含可跟进事项.Agent 已按用户要求提取行动项, 并为每条行动项保留原文依据片段.",
+                    "sections": [
+                        {
+                            "title": "行动项概览",
+                            "items": ["已识别文本中的待办、负责人、截止时间或跟进线索."],
+                        }
+                    ],
+                    "action_items": _mock_action_items(text, search_results),
+                    "follow_up_questions": [
+                        "是否需要进一步指定每个行动项的优先级？",
+                        "是否需要将待确认负责人或截止时间补全？",
+                    ],
+                }
+            )
+
+        if any(keyword in task for keyword in ["观点", "主题", "分类", "总结", "核心"]):
+            return _normalize_analysis(
+                {
+                    "summary": "文本的核心观点可以按主题进行归纳.Agent 已根据用户任务进行通用总结, 不强行生成行动项.",
+                    "sections": [
+                        {
+                            "title": "核心观点",
+                            "items": _mock_general_items(text),
+                        },
+                        {
+                            "title": "结构化总结",
+                            "items": [
+                                "文本信息已按主题组织, 便于进一步复盘或汇报.",
+                                "如需更细分类, 可以在任务中指定分类维度.",
+                            ],
+                        },
+                    ],
+                    "follow_up_questions": ["是否需要按业务、技术、风险等维度进一步拆分？"],
+                }
+            )
+
+        if "interview" in task_text or "summary" in task_text:
+            return _normalize_analysis(
+                {
+                    "summary": "The text is processed as a general document analysis task. The agent uses task-driven extraction and adaptive report generation.",
+                    "sections": [
+                        {
+                            "title": "Key Points",
+                            "items": _mock_general_items(text),
+                        }
+                    ],
+                    "follow_up_questions": ["Should optional tools be introduced in the next stage?"],
+                }
+            )
+
+        return _normalize_analysis(
+            {
+                "summary": "Agent 已根据用户任务对文本进行通用分析, 并生成统一结构化结果.Mock 模式仅用于降级占位.",
+                "sections": [
+                    {
+                        "title": "关键信息",
+                        "items": _mock_general_items(text),
+                    }
+                ],
+                "follow_up_questions": ["是否需要指定更具体的分析维度？"],
+            }
+        )
 
     def analyze_meeting(self, meeting_text: str) -> dict[str, Any]:
         """兼容第二阶段旧接口."""
         return self.analyze_text(
             meeting_text,
             "请整理这份会议记录, 提取会议概要, 关键结论, 行动项和风险点.",
+            extract_action_items=True,
         )
 
 
@@ -413,6 +431,7 @@ class TextProcessingAgent:
         memory.set("input_path", input_path)
         memory.set("output_path", output_path)
         memory.set("steps", self.steps)
+        memory.set("extract_action_items", _should_extract_action_items(task))
 
         plan = self._create_plan(task, input_path, output_path)
 
@@ -474,6 +493,7 @@ class TextProcessingAgent:
                 output_path=output_path,
                 tool_descriptions=self.executor.tool_descriptions,
             )
+            plan = self._enhance_plan(task, plan)
             if validate_plan(plan, available_tools):
                 self.last_planner_mode = "llm_planner"
                 return plan
@@ -481,7 +501,59 @@ class TextProcessingAgent:
             self.last_planner_error = str(e)
 
         self.last_planner_mode = "simple_planner_fallback"
-        return self.simple_planner.create_plan(task, input_path, output_path)
+        return self._enhance_plan(task, self.simple_planner.create_plan(task, input_path, output_path))
+
+    def _enhance_plan(self, task: str, plan: list[PlanStep]) -> list[PlanStep]:
+        """根据任务意图增强计划，必要时插入 keyword_search 并标记是否提取行动项."""
+        enhanced: list[PlanStep] = []
+        should_use_search = _should_use_keyword_search(task)
+        has_keyword_search = any(step.tool_name == "keyword_search" for step in plan)
+        search_inserted = False
+        extract_action_items = _should_extract_action_items(task)
+
+        for step in plan:
+            if step.tool_name == "text_extractor":
+                tool_input = dict(step.tool_input)
+                tool_input["task"] = tool_input.get("task") or task
+                tool_input["extract_action_items"] = extract_action_items
+
+                if should_use_search and not has_keyword_search and not search_inserted:
+                    enhanced.append(
+                        PlanStep(
+                            step_id=0,
+                            goal="根据用户任务搜索原文中的候选证据片段",
+                            tool_name="keyword_search",
+                            tool_input={
+                                "keywords": _build_search_keywords(task),
+                                "context_lines": 1,
+                                "max_results": 10,
+                            },
+                            expected_output="关键词命中行及上下文",
+                        )
+                    )
+                    search_inserted = True
+
+                enhanced.append(
+                    PlanStep(
+                        step_id=0,
+                        goal=step.goal,
+                        tool_name=step.tool_name,
+                        tool_input=tool_input,
+                        expected_output=step.expected_output,
+                    )
+                )
+            else:
+                enhanced.append(
+                    PlanStep(
+                        step_id=0,
+                        goal=step.goal,
+                        tool_name=step.tool_name,
+                        tool_input=dict(step.tool_input),
+                        expected_output=step.expected_output,
+                    )
+                )
+
+        return _renumber_plan(enhanced)
 
     def _record_observation(self, plan_step: PlanStep, observation: Observation) -> None:
         """将执行层 Observation 转换为展示层 AgentStep."""
@@ -503,9 +575,17 @@ class TextProcessingAgent:
         if plan_step.tool_name == "file_reader":
             return f"成功读取输入文件, 共 {len(str(observation.output))} 个字符."
 
+        if plan_step.tool_name == "keyword_search" and isinstance(observation.output, dict):
+            match_count = len(observation.output.get("matches", []))
+            keyword_count = len(observation.output.get("keywords", []))
+            return f"关键词搜索完成, 使用 {keyword_count} 个关键词, 命中 {match_count} 条候选证据."
+
         if plan_step.tool_name in {"text_extractor", "llm_analyze_meeting"} and isinstance(observation.output, dict):
             section_count = len(observation.output.get("sections", []))
             question_count = len(observation.output.get("follow_up_questions", []))
+            action_count = len(observation.output.get("action_items", []) or [])
+            if action_count:
+                return f"文本分析完成, 生成 {section_count} 个动态章节, {action_count} 条可追溯行动项, {question_count} 个待确认问题."
             return f"文本分析完成, 生成 {section_count} 个动态章节, {question_count} 个待确认问题."
 
         if plan_step.tool_name == "build_report":
@@ -565,6 +645,25 @@ def build_markdown_report(analysis: dict[str, Any], steps: list[AgentStep], task
         lines.append("- 待确认")
         lines.append("")
 
+    action_items = normalized.get("action_items", []) or []
+    if action_items:
+        lines.append("## 可追溯行动项")
+        lines.append("")
+        lines.append("| 行动项 | 负责人 | 截止时间 | 优先级 | 可信度 | 依据片段 |")
+        lines.append("|--------|--------|----------|--------|--------|----------|")
+        for item in action_items:
+            lines.append(
+                "| {task} | {owner} | {deadline} | {priority} | {confidence} | {evidence} |".format(
+                    task=_escape_markdown_table(str(item.get("task", "待确认"))),
+                    owner=_escape_markdown_table(str(item.get("owner", "待确认"))),
+                    deadline=_escape_markdown_table(str(item.get("deadline", "待确认"))),
+                    priority=_escape_markdown_table(str(item.get("priority", "待确认"))),
+                    confidence=_escape_markdown_table(str(item.get("confidence", "待确认"))),
+                    evidence=_escape_markdown_table(str(item.get("evidence", "待确认"))),
+                )
+            )
+        lines.append("")
+
     follow_up_questions = normalized.get("follow_up_questions", []) or []
     if follow_up_questions:
         lines.append("## 待确认问题")
@@ -589,35 +688,21 @@ def build_markdown_report(analysis: dict[str, Any], steps: list[AgentStep], task
 
 
 def _normalize_analysis(analysis: dict[str, Any]) -> dict[str, Any]:
-    """将分析结果归一化为第三阶段统一 Schema."""
+    """将分析结果归一化为第五阶段通用 Schema."""
     if not isinstance(analysis, dict):
         return {
             "summary": "待确认",
             "sections": [{"title": "分析结果", "items": [str(analysis)]}],
             "follow_up_questions": [],
+            "action_items": [],
         }
 
     if "summary" in analysis and "sections" in analysis:
-        sections = analysis.get("sections") or []
-        normalized_sections: list[dict[str, Any]] = []
-        for section in sections:
-            if isinstance(section, dict):
-                items = section.get("items", [])
-                if isinstance(items, str):
-                    items = [items]
-                normalized_sections.append(
-                    {
-                        "title": str(section.get("title", "未命名章节")),
-                        "items": items if isinstance(items, list) else [str(items)],
-                    }
-                )
-            else:
-                normalized_sections.append({"title": "分析结果", "items": [str(section)]})
-
         return {
             "summary": str(analysis.get("summary", "待确认")),
-            "sections": normalized_sections or [{"title": "分析结果", "items": ["待确认"]}],
-            "follow_up_questions": analysis.get("follow_up_questions", []) or [],
+            "sections": _normalize_sections(analysis.get("sections", [])),
+            "follow_up_questions": _normalize_string_list(analysis.get("follow_up_questions", []) or []),
+            "action_items": _normalize_action_items(analysis.get("action_items", []) or []),
         }
 
     sections: list[dict[str, Any]] = []
@@ -626,34 +711,272 @@ def _normalize_analysis(analysis: dict[str, Any]) -> dict[str, Any]:
     if key_conclusions:
         sections.append({"title": "关键结论", "items": [str(item) for item in key_conclusions]})
 
-    action_items = analysis.get("action_items", []) or []
-    if action_items:
-        formatted_actions = []
-        for item in action_items:
-            if isinstance(item, dict):
-                formatted_actions.append(
-                    "; ".join(
-                        [
-                            f"任务:{item.get('task', '待确认')}",
-                            f"负责人:{item.get('owner', '待确认')}",
-                            f"截止时间:{item.get('deadline', '待确认')}",
-                            f"优先级:{item.get('priority', '待确认')}",
-                        ]
-                    )
-                )
-            else:
-                formatted_actions.append(str(item))
-        sections.append({"title": "行动项", "items": formatted_actions})
-
     risks = analysis.get("risks", []) or []
     if risks:
         sections.append({"title": "风险与问题", "items": [str(item) for item in risks]})
 
+    action_items = _normalize_action_items(analysis.get("action_items", []) or [])
+    if action_items and not sections:
+        sections.append({"title": "行动项概览", "items": [str(item.get("task", "待确认")) for item in action_items]})
+
     return {
         "summary": str(analysis.get("meeting_summary", analysis.get("summary", "待确认"))),
         "sections": sections or [{"title": "分析结果", "items": ["待确认"]}],
-        "follow_up_questions": analysis.get("follow_up_questions", []) or [],
+        "follow_up_questions": _normalize_string_list(analysis.get("follow_up_questions", []) or []),
+        "action_items": action_items,
     }
+
+
+def _normalize_sections(sections: Any) -> list[dict[str, Any]]:
+    """归一化动态章节."""
+    if not isinstance(sections, list):
+        return [{"title": "分析结果", "items": [str(sections)]}]
+
+    normalized_sections: list[dict[str, Any]] = []
+    for section in sections:
+        if isinstance(section, dict):
+            items = section.get("items", [])
+            if isinstance(items, str):
+                items = [items]
+            normalized_sections.append(
+                {
+                    "title": str(section.get("title", "未命名章节")),
+                    "items": items if isinstance(items, list) else [str(items)],
+                }
+            )
+        else:
+            normalized_sections.append({"title": "分析结果", "items": [str(section)]})
+
+    return normalized_sections or [{"title": "分析结果", "items": ["待确认"]}]
+
+
+def _normalize_action_items(action_items: Any) -> list[dict[str, str]]:
+    """归一化可追溯行动项."""
+    if not isinstance(action_items, list):
+        return []
+
+    normalized: list[dict[str, str]] = []
+    for item in action_items:
+        if isinstance(item, dict):
+            task = str(item.get("task", "")).strip()
+            if not task:
+                continue
+            normalized.append(
+                {
+                    "task": task,
+                    "owner": str(item.get("owner", "待确认") or "待确认"),
+                    "deadline": str(item.get("deadline", "待确认") or "待确认"),
+                    "priority": str(item.get("priority", "待确认") or "待确认"),
+                    "evidence": str(item.get("evidence", "待确认") or "待确认")[:80],
+                    "confidence": str(item.get("confidence", "待确认") or "待确认"),
+                }
+            )
+    return normalized
+
+
+def _normalize_string_list(values: Any) -> list[str]:
+    """归一化字符串列表."""
+    if isinstance(values, list):
+        return [str(value) for value in values]
+    if values:
+        return [str(values)]
+    return []
+
+
+def _should_extract_action_items(task: str) -> bool:
+    """判断当前任务是否需要输出可追溯行动项。"""
+    return any(keyword in task for keyword in ACTION_ITEM_KEYWORDS)
+
+
+def _should_use_keyword_search(task: str) -> bool:
+    """判断当前任务是否需要先进行关键词证据检索。"""
+    return any(keyword in task for keyword in [*ACTION_ITEM_KEYWORDS, *RISK_KEYWORDS])
+
+
+def _build_search_keywords(task: str) -> list[str]:
+    """根据任务意图生成关键词搜索列表。"""
+    keywords: list[str] = []
+    if any(keyword in task for keyword in ACTION_ITEM_KEYWORDS):
+        keywords.extend(ACTION_SEARCH_KEYWORDS)
+    if any(keyword in task for keyword in RISK_KEYWORDS):
+        keywords.extend(RISK_SEARCH_KEYWORDS)
+    return _dedupe(keywords)
+
+
+def _renumber_plan(plan: list[PlanStep]) -> list[PlanStep]:
+    """重排计划步骤编号。"""
+    return [
+        PlanStep(
+            step_id=index,
+            goal=step.goal,
+            tool_name=step.tool_name,
+            tool_input=dict(step.tool_input),
+            expected_output=step.expected_output,
+        )
+        for index, step in enumerate(plan, start=1)
+    ]
+
+
+def _dedupe(values: list[str]) -> list[str]:
+    """按原顺序去重。"""
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
+
+
+def _build_action_item_instruction(extract_action_items: bool) -> str:
+    """构建是否输出 action_items 的 prompt 片段。"""
+    if not extract_action_items:
+        return (
+            "action_items 规则:\n"
+            "- 当前任务不是行动项类任务, 不要输出 action_items 字段;\n"
+            "- 不要为了填充字段而编造任务、负责人或截止时间."
+        )
+
+    return """
+action_items 规则:
+- 当前任务涉及行动项、负责人、截止时间、跟进事项、任务分工或待办事项, 请额外输出 action_items 字段;
+- action_items 必须是数组, 每项格式为:
+  {
+    "task": "行动项描述",
+    "owner": "负责人或待确认",
+    "deadline": "截止时间或待确认",
+    "priority": "high / medium / low / 待确认",
+    "evidence": "原文依据片段, 最长 80 字",
+    "confidence": "high / medium / low"
+  }
+- evidence 必须是原文中能支撑该行动项的连续片段, 不能写“根据全文总结”;
+- 原文没有明确负责人或截止时间时写“待确认”;
+- 找不到明确依据时不要强行生成行动项.
+""".strip()
+
+
+def _format_search_results(search_results: dict[str, Any] | None) -> str:
+    """将 keyword_search 结果压缩为 prompt 可读文本。"""
+    if not search_results:
+        return "无"
+
+    matches = search_results.get("matches", []) if isinstance(search_results, dict) else []
+    if not matches:
+        return "无命中"
+
+    lines: list[str] = []
+    for match in matches[:10]:
+        if not isinstance(match, dict):
+            continue
+        keyword = match.get("keyword", "")
+        line_no = match.get("line_no", "")
+        line = match.get("line", "")
+        before = " / ".join(str(item) for item in match.get("context_before", []) or [])
+        after = " / ".join(str(item) for item in match.get("context_after", []) or [])
+        context = ""
+        if before:
+            context += f" 上文:{before}"
+        if after:
+            context += f" 下文:{after}"
+        lines.append(f"- 关键词:{keyword}; 行号:{line_no}; 命中:{line};{context}")
+
+    return "\n".join(lines) or "无命中"
+
+
+def _mock_action_items(text: str, search_results: dict[str, Any] | None = None) -> list[dict[str, str]]:
+    """根据输入文本生成结构正确的 Mock 行动项。"""
+    evidence_candidates = _extract_evidence_candidates(text, search_results)
+    if not evidence_candidates:
+        evidence_candidates = ["原文未找到明确行动项，需人工确认"]
+
+    action_items: list[dict[str, str]] = []
+    for evidence in evidence_candidates[:3]:
+        action_items.append(
+            {
+                "task": _summarize_evidence_as_task(evidence),
+                "owner": _guess_owner(evidence),
+                "deadline": _guess_deadline(evidence),
+                "priority": "medium",
+                "evidence": evidence[:80],
+                "confidence": "medium" if "待确认" in evidence else "high",
+            }
+        )
+    return action_items
+
+
+def _mock_risk_items(text: str, search_results: dict[str, Any] | None = None) -> list[str]:
+    """根据输入文本生成 Mock 风险项。"""
+    candidates = _extract_evidence_candidates(text, search_results)
+    if candidates:
+        return [f"候选风险或问题:{candidate}" for candidate in candidates[:3]]
+    return ["未在文本中找到明确风险关键词, 建议结合业务背景人工复核."]
+
+
+def _mock_general_items(text: str) -> list[str]:
+    """根据输入文本生成 Mock 通用要点。"""
+    sentences = _split_text_units(text)
+    return [sentence[:120] for sentence in sentences[:3]] or ["文本内容较少, 需要更多上下文才能生成详细分析."]
+
+
+def _extract_evidence_candidates(text: str, search_results: dict[str, Any] | None = None) -> list[str]:
+    """优先从搜索结果中提取依据候选，否则从文本中按简单规则截取。"""
+    candidates: list[str] = []
+    if isinstance(search_results, dict):
+        for match in search_results.get("matches", []) or []:
+            if isinstance(match, dict) and match.get("line"):
+                candidates.append(str(match["line"]).strip())
+
+    if candidates:
+        return _dedupe([candidate for candidate in candidates if candidate])
+
+    trigger_words = [*ACTION_SEARCH_KEYWORDS, *RISK_SEARCH_KEYWORDS]
+    for unit in _split_text_units(text):
+        if any(word in unit for word in trigger_words):
+            candidates.append(unit)
+
+    return _dedupe(candidates)
+
+
+def _split_text_units(text: str) -> list[str]:
+    """按行和常见中文标点切分文本片段。"""
+    units: list[str] = []
+    for line in text.splitlines():
+        current = line.strip()
+        if not current:
+            continue
+        for sep in ["。", "；", ";"]:
+            current = current.replace(sep, "\n")
+        units.extend(part.strip() for part in current.split("\n") if part.strip())
+    if not units and text.strip():
+        units.append(text.strip())
+    return units
+
+
+def _summarize_evidence_as_task(evidence: str) -> str:
+    """用简单规则将依据片段压缩为 Mock 行动项描述。"""
+    cleaned = evidence.strip()
+    if len(cleaned) <= 36:
+        return cleaned
+    return cleaned[:35] + "…"
+
+
+def _guess_owner(evidence: str) -> str:
+    """从依据片段中粗略识别负责人，否则待确认。"""
+    for marker in ["负责", "由"]:
+        if marker in evidence:
+            before = evidence.split(marker, 1)[0].strip(" ，,。:：")
+            if before:
+                return before[-8:]
+    return "待确认"
+
+
+def _guess_deadline(evidence: str) -> str:
+    """从依据片段中粗略识别截止时间，否则待确认。"""
+    for marker in ["今天", "明天", "本周", "下周", "周一", "周二", "周三", "周四", "周五", "月底"]:
+        if marker in evidence:
+            return marker
+    return "待确认"
 
 
 def _parse_json_content(content: str) -> dict[str, Any]:
