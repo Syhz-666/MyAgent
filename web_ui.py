@@ -326,5 +326,15 @@ def build_ui() -> gr.Blocks:
     return demo
 
 
+def launch_web_ui() -> None:
+    """启动 Web UI，并自动打开浏览器。"""
+    app = build_ui().queue()
+    try:
+        app.launch(inbrowser=True)
+    except TypeError:
+        # 兼容不支持 inbrowser 参数的旧版 Gradio。
+        app.launch()
+
+
 if __name__ == "__main__":
-    build_ui().queue().launch()
+    launch_web_ui()
