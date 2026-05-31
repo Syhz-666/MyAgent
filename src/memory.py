@@ -40,6 +40,11 @@ class AgentMemory:
         - file_reader 的输出保存为 text，同时兼容 meeting_text；
         - text_extractor / llm_analyze_meeting 的输出保存为 analysis；
         - keyword_search 的输出保存为 keyword_search_results；
+        - table_reader 的输出保存为 table_data；
+        - table_profiler 的输出保存为 table_profile；
+        - table_cleaner 的输出保存为 cleaned_data / cleaner_output；
+        - table_writer 的输出保存为 cleaned_table_path；
+        - table_report_builder 的输出保存为 report，同时也作为 file_writer 的 content；
         - build_report 的输出保存为 report，同时也作为 file_writer 的 content；
         - file_writer 的输出保存为 written_path。
         """
@@ -51,9 +56,18 @@ class AgentMemory:
             self.set("meeting_text", observation.output)
         elif step.tool_name == "keyword_search":
             self.set("keyword_search_results", observation.output)
+        elif step.tool_name == "table_reader":
+            self.set("table_data", observation.output)
+        elif step.tool_name == "table_profiler":
+            self.set("table_profile", observation.output)
+        elif step.tool_name == "table_cleaner":
+            self.set("cleaned_data", observation.output)
+            self.set("cleaner_output", observation.output)
+        elif step.tool_name == "table_writer":
+            self.set("cleaned_table_path", observation.output)
         elif step.tool_name in {"text_extractor", "llm_analyze_meeting"}:
             self.set("analysis", observation.output)
-        elif step.tool_name == "build_report":
+        elif step.tool_name in {"build_report", "table_report_builder"}:
             self.set("report", observation.output)
             self.set("content", observation.output)
         elif step.tool_name == "file_writer":

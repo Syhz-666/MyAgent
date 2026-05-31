@@ -11,11 +11,37 @@ from typing import Any, Callable
 try:
     from .memory import AgentMemory
     from .schemas import Observation, PlanStep
-    from .tools import BaseTool, BuildReportTool, FileReader, FileWriter, KeywordSearch, LLMAnalyzeMeetingTool, TextExtractor
+    from .tools import (
+        BaseTool,
+        BuildReportTool,
+        FileReader,
+        FileWriter,
+        KeywordSearch,
+        LLMAnalyzeMeetingTool,
+        TableCleaner,
+        TableProfiler,
+        TableReader,
+        TableReportBuilder,
+        TableWriter,
+        TextExtractor,
+    )
 except ImportError:  # pragma: no cover - 支持直接导入
     from memory import AgentMemory
     from schemas import Observation, PlanStep
-    from tools import BaseTool, BuildReportTool, FileReader, FileWriter, KeywordSearch, LLMAnalyzeMeetingTool, TextExtractor
+    from tools import (
+        BaseTool,
+        BuildReportTool,
+        FileReader,
+        FileWriter,
+        KeywordSearch,
+        LLMAnalyzeMeetingTool,
+        TableCleaner,
+        TableProfiler,
+        TableReader,
+        TableReportBuilder,
+        TableWriter,
+        TextExtractor,
+    )
 
 
 class AgentExecutor:
@@ -30,6 +56,11 @@ class AgentExecutor:
             "keyword_search": KeywordSearch(),
             "llm_analyze_meeting": LLMAnalyzeMeetingTool(llm_client),
             "build_report": BuildReportTool(report_builder),
+            "table_reader": TableReader(),
+            "table_profiler": TableProfiler(),
+            "table_cleaner": TableCleaner(),
+            "table_writer": TableWriter(),
+            "table_report_builder": TableReportBuilder(),
         }
         self.tool_descriptions: list[dict[str, Any]] = [
             {
@@ -67,6 +98,31 @@ class AgentExecutor:
                 "description": "将 Markdown 报告写入本地文件。",
                 "params": {"path": "输出文件路径", "content": "报告内容，由 build_report 输出补充"},
             },
+            {
+                "name": "table_reader",
+                "description": "读取 CSV 文件，转换为统一表格结构，并自动推断列类型。",
+                "params": {"path": "输入 CSV 文件路径"},
+            },
+            {
+                "name": "table_profiler",
+                "description": "分析表格数据质量问题，输出结构化诊断结果。",
+                "params": {"table_data": "table_reader 输出的表格结构"},
+            },
+            {
+                "name": "table_cleaner",
+                "description": "根据诊断结果执行安全清洗，不删除可能有业务意义的数据。",
+                "params": {"table_data": "原始表格结构", "profile": "质量诊断结果"},
+            },
+            {
+                "name": "table_writer",
+                "description": "将清洗后的表格数据写入本地 CSV 文件。",
+                "params": {"table_data": "table_cleaner 输出", "path": "输出 CSV 文件路径"},
+            },
+            {
+                "name": "table_report_builder",
+                "description": "根据表格诊断结果和清洗操作生成 Markdown 清洗报告。",
+                "params": {"table_data": "原始表格", "profile": "诊断结果", "cleaner_output": "清洗结果"},
+            },
         ]
 
     def execute(self, step: PlanStep, memory: AgentMemory) -> Observation:
@@ -103,6 +159,33 @@ class AgentExecutor:
         if step.tool_name == "file_reader":
             # 输入路径必须以 Agent 运行上下文为准，避免 LLMPlanner 编造路径覆盖真实文件。
             return {"path": memory.get("input_path") or step.tool_input.get("path")}
+
+        if step.tool_name == "table_reader":
+            return {"path": memory.get("input_path") or step.tool_input.get("path")}
+
+        if step.tool_name == "table_profiler":
+            return {"table_data": memory.get("table_data") or step.tool_input.get("table_data")}
+
+        if step.tool_name == "table_cleaner":
+            return {
+                "table_data": memory.get("table_data") or step.tool_input.get("table_data"),
+                "profile": memory.get("table_profile") or step.tool_input.get("profile"),
+            }
+
+        if step.tool_name == "table_writer":
+            return {
+                "table_data": memory.get("cleaned_data") or step.tool_input.get("table_data"),
+                "path": memory.get("table_output_path") or step.tool_input.get("path") or memory.get("output_path"),
+            }
+
+        if step.tool_name == "table_report_builder":
+            return {
+                "table_data": memory.get("table_data") or step.tool_input.get("table_data"),
+                "profile": memory.get("table_profile") or step.tool_input.get("profile"),
+                "cleaner_output": memory.get("cleaner_output") or step.tool_input.get("cleaner_output"),
+                "steps": memory.get("steps", []) or step.tool_input.get("steps") or [],
+                "cleaned_path": memory.get("cleaned_table_path") or step.tool_input.get("cleaned_path") or "",
+            }
 
         if step.tool_name == "keyword_search":
             return {

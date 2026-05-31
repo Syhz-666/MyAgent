@@ -18,19 +18,27 @@ try:
         build_search_keywords,
         should_extract_action_items,
         should_use_keyword_search,
+        should_use_table_processing,
     )
     from .llm import LLMClient, MockLLMClient, OpenAILLMClient
     from .memory import AgentMemory
     from .planner import LLMPlanner, SimplePlanner, validate_plan
     from .reports.markdown_report import build_markdown_report
+    from .reports.table_report import build_table_cleaning_report
     from .schemas import Observation, PlanStep
 except ImportError:  # pragma: no cover - 支持直接运行 python src/agent.py
     from executor import AgentExecutor
-    from intent.task_intent import build_search_keywords, should_extract_action_items, should_use_keyword_search
+    from intent.task_intent import (
+        build_search_keywords,
+        should_extract_action_items,
+        should_use_keyword_search,
+        should_use_table_processing,
+    )
     from llm import LLMClient, MockLLMClient, OpenAILLMClient
     from memory import AgentMemory
     from planner import LLMPlanner, SimplePlanner, validate_plan
     from reports.markdown_report import build_markdown_report
+    from reports.table_report import build_table_cleaning_report
     from schemas import Observation, PlanStep
 
 
@@ -87,6 +95,7 @@ class TextProcessingAgent:
         memory.set("task", task)
         memory.set("input_path", input_path)
         memory.set("output_path", output_path)
+        memory.set("table_output_path", _make_table_output_path(output_path))
         memory.set("steps", self.steps)
         memory.set("extract_action_items", should_extract_action_items(task))
 
@@ -141,8 +150,15 @@ class TextProcessingAgent:
         )
 
     def _create_plan(self, task: str, input_path: str, output_path: str) -> list[PlanStep]:
-        """优先使用 LLMPlanner，失败或校验不通过时回退 SimplePlanner。"""
+        """优先识别表格任务；文本任务使用 LLMPlanner，失败或校验不通过时回退 SimplePlanner。"""
         available_tools = set(self.executor.tools.keys())
+        if should_use_table_processing(task, input_path):
+            plan = self._build_table_plan(input_path, output_path)
+            if validate_plan(plan, available_tools):
+                self.last_planner_mode = "table_rule_plan"
+                return plan
+            self.last_planner_error = "表格工具链计划校验失败"
+
         try:
             plan = self.llm_planner.create_plan(
                 task=task,
@@ -212,6 +228,49 @@ class TextProcessingAgent:
 
         return _renumber_plan(enhanced)
 
+    def _build_table_plan(self, input_path: str, output_path: str) -> list[PlanStep]:
+        """构建确定性的表格处理工具链。"""
+        table_output_path = _make_table_output_path(output_path)
+        return _renumber_plan(
+            [
+                PlanStep(
+                    step_id=0,
+                    goal="读取 CSV 表格并推断列类型",
+                    tool_name="table_reader",
+                    tool_input={"path": input_path},
+                    expected_output="统一表格结构",
+                ),
+                PlanStep(
+                    step_id=0,
+                    goal="诊断表格中的空行、重复、缺失值和格式问题",
+                    tool_name="table_profiler",
+                    tool_input={},
+                    expected_output="表格质量诊断结果",
+                ),
+                PlanStep(
+                    step_id=0,
+                    goal="执行安全清洗并保留需要人工确认的异常值",
+                    tool_name="table_cleaner",
+                    tool_input={},
+                    expected_output="清洗后的表格数据和操作记录",
+                ),
+                PlanStep(
+                    step_id=0,
+                    goal="写入清洗后的 CSV 表格",
+                    tool_name="table_writer",
+                    tool_input={"path": table_output_path},
+                    expected_output="清洗后 CSV 文件路径",
+                ),
+                PlanStep(
+                    step_id=0,
+                    goal="生成表格清洗 Markdown 报告",
+                    tool_name="table_report_builder",
+                    tool_input={},
+                    expected_output="表格清洗报告内容",
+                ),
+            ]
+        )
+
     def _record_observation(self, plan_step: PlanStep, observation: Observation) -> None:
         """将执行层 Observation 转换为展示层 AgentStep。"""
         self.steps.append(
@@ -231,6 +290,23 @@ class TextProcessingAgent:
 
         if plan_step.tool_name == "file_reader":
             return f"成功读取输入文件, 共 {len(str(observation.output))} 个字符."
+
+        if plan_step.tool_name == "table_reader" and isinstance(observation.output, dict):
+            return f"成功读取表格, 共 {observation.output.get('row_count', 0)} 行、{len(observation.output.get('columns', []) or [])} 列."
+
+        if plan_step.tool_name == "table_profiler" and isinstance(observation.output, dict):
+            return f"表格质量诊断完成, 发现 {len(observation.output.get('issues', []) or [])} 类问题."
+
+        if plan_step.tool_name == "table_cleaner" and isinstance(observation.output, dict):
+            operation_count = len(observation.output.get("operations", []) or [])
+            warning_count = len(observation.output.get("warnings", []) or [])
+            return f"表格清洗完成, 执行 {operation_count} 类操作, 记录 {warning_count} 类需人工确认事项."
+
+        if plan_step.tool_name == "table_writer":
+            return f"清洗后表格写入成功:{observation.output}"
+
+        if plan_step.tool_name == "table_report_builder":
+            return f"表格清洗报告生成完成, 共 {len(str(observation.output))} 个字符."
 
         if plan_step.tool_name == "keyword_search" and isinstance(observation.output, dict):
             match_count = len(observation.output.get("matches", []))
@@ -255,6 +331,19 @@ class TextProcessingAgent:
 
     def _build_final_report(self, memory: AgentMemory) -> str:
         """在所有计划步骤完成后，重建包含完整执行摘要的最终报告。"""
+        if memory.get("table_data"):
+            final_report = build_table_cleaning_report(
+                source_path=memory.get("input_path", ""),
+                table_data=memory.get("table_data", {}),
+                profile=memory.get("table_profile", {}),
+                cleaner_output=memory.get("cleaner_output", {}),
+                steps=self.steps,
+                cleaned_path=memory.get("cleaned_table_path", ""),
+            )
+            memory.set("report", final_report)
+            memory.set("content", final_report)
+            return final_report
+
         analysis = memory.get("analysis", {})
         task = memory.get("task", "")
         final_report = build_markdown_report(analysis, self.steps, task)
@@ -265,6 +354,12 @@ class TextProcessingAgent:
 
 # 向后兼容第二阶段入口和旧 import。
 MeetingReportAgent = TextProcessingAgent
+
+
+def _make_table_output_path(output_path: str) -> str:
+    """根据报告输出路径生成 cleaned CSV 路径。"""
+    path = Path(output_path)
+    return str(path.with_name(f"{path.stem}_cleaned.csv"))
 
 
 def _renumber_plan(plan: list[PlanStep]) -> list[PlanStep]:

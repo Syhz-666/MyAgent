@@ -162,15 +162,18 @@ class LLMPlanner:
 
 
 def validate_plan(plan: list[PlanStep], available_tools: set[str]) -> bool:
-    """校验计划是否合法。
+    """校验计划是否合法，支持文本工具链和表格工具链。"""
+    if not _validate_common_plan_shape(plan, available_tools):
+        return False
 
-    当前项目仍是文本处理 Agent，因此要求：
-    - 计划非空；
-    - 所有 tool_name 都在工具注册表中；
-    - step_id 连续；
-    - 必须包含 file_reader、text_extractor、build_report、file_writer；
-    - 关键工具顺序必须是读取 → 分析 → 报告 → 写入。
-    """
+    tool_names = [step.tool_name for step in plan]
+    if "table_reader" in tool_names:
+        return _validate_table_plan(tool_names)
+    return _validate_text_plan(tool_names)
+
+
+def _validate_common_plan_shape(plan: list[PlanStep], available_tools: set[str]) -> bool:
+    """校验计划通用结构。"""
     if not plan:
         return False
 
@@ -179,9 +182,11 @@ def validate_plan(plan: list[PlanStep], available_tools: set[str]) -> bool:
         return False
 
     tool_names = [step.tool_name for step in plan]
-    if any(tool_name not in available_tools for tool_name in tool_names):
-        return False
+    return not any(tool_name not in available_tools for tool_name in tool_names)
 
+
+def _validate_text_plan(tool_names: list[str]) -> bool:
+    """校验文本处理工具链。"""
     required_tools = ["file_reader", "text_extractor", "build_report", "file_writer"]
     if any(tool_name not in tool_names for tool_name in required_tools):
         return False
@@ -200,6 +205,16 @@ def validate_plan(plan: list[PlanStep], available_tools: set[str]) -> bool:
             return False
 
     return True
+
+
+def _validate_table_plan(tool_names: list[str]) -> bool:
+    """校验表格处理工具链。"""
+    expected_order = ["table_reader", "table_profiler", "table_cleaner", "table_writer", "table_report_builder"]
+    if any(tool_name not in tool_names for tool_name in expected_order):
+        return False
+
+    indices = [_first_index(tool_names, tool_name) for tool_name in expected_order]
+    return indices == sorted(indices)
 
 
 def _first_index(values: list[str], target: str) -> int:

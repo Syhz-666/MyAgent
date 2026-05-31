@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 ACTION_ITEM_KEYWORDS = ["行动项", "负责人", "截止", "跟进", "任务", "待办", "分工"]
 RISK_KEYWORDS = ["风险", "问题", "阻塞", "延期", "依赖", "不稳定", "待确认"]
 ACTION_SEARCH_KEYWORDS = ["负责", "完成", "截止", "跟进", "同步", "推进", "排期", "待办"]
 RISK_SEARCH_KEYWORDS = ["风险", "问题", "阻塞", "延期", "依赖", "不稳定", "待确认"]
+TABLE_KEYWORDS = ["表格", "CSV", "csv", "Excel", "excel", "数据清洗", "表格处理", "清洗数据", "清洗", "去重"]
+TABLE_FILE_SUFFIXES = {".csv"}
 
 
 def should_extract_action_items(task: str) -> bool:
@@ -16,6 +20,21 @@ def should_extract_action_items(task: str) -> bool:
 def should_use_keyword_search(task: str) -> bool:
     """判断当前任务是否需要先进行关键词证据检索。"""
     return any(keyword in task for keyword in [*ACTION_ITEM_KEYWORDS, *RISK_KEYWORDS])
+
+
+def is_table_task(task: str) -> bool:
+    """判断当前任务是否属于表格处理。"""
+    return any(keyword in task for keyword in TABLE_KEYWORDS)
+
+
+def is_table_file(input_path: str) -> bool:
+    """根据输入文件扩展名判断是否为当前阶段支持的表格文件。"""
+    return Path(input_path).suffix.lower() in TABLE_FILE_SUFFIXES
+
+
+def should_use_table_processing(task: str, input_path: str) -> bool:
+    """判断是否应走表格处理工具链。"""
+    return is_table_file(input_path) or is_table_task(task)
 
 
 def build_search_keywords(task: str) -> list[str]:
